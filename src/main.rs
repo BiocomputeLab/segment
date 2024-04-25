@@ -1,13 +1,12 @@
-
 // Segment command line tool
 // Author: Thomas Gorochowski <tom@chofski.co.uk>
 
 use bio;
-use bio::io::fasta;
-use bio::io::fastq;
-use bio::alphabets::dna;
 use bio::alignment::pairwise::*;
 use bio::alignment::Alignment;
+use bio::alphabets::dna;
+use bio::io::fasta;
+use bio::io::fastq;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -35,16 +34,14 @@ fn cut_reorient_seq(seq: &Vec<u8>, start_idx: usize, end_idx: usize, revcomp: bo
     let new_seq: Vec<u8>;
     if start_idx < end_idx {
         new_seq = seq[start_idx..end_idx].to_vec();
-    }
-    else{
+    } else {
         if revcomp == true {
             let rc_seq = dna::revcomp(seq);
-            new_seq = rc_seq[(seq.len()-start_idx)..(seq.len()-end_idx)].to_vec();
-        }
-        else {
+            new_seq = rc_seq[(seq.len() - start_idx)..(seq.len() - end_idx)].to_vec();
+        } else {
             let mut rev_seq = seq.clone();
             rev_seq.reverse();
-            new_seq = rev_seq[(seq.len()-start_idx)..(seq.len()-end_idx)].to_vec();
+            new_seq = rev_seq[(seq.len() - start_idx)..(seq.len() - end_idx)].to_vec();
         }
     }
     new_seq
@@ -78,8 +75,7 @@ fn classify_read_segments(segments: &HashMap<String, Vec<u8>>, read_seq: &Vec<u8
         if seg_alignment.score >= min_score {
             seg_str.push_str(" - ");
             seg_str.push_str(seg_name.as_str());
-        }
-        else {
+        } else {
             let seg_seq_rc = dna::revcomp(seg_seq).clone();
             let seg_alignment_rc = align_segment(&seg_seq_rc, read_seq);
             if seg_alignment_rc.score >= min_score {
@@ -93,7 +89,11 @@ fn classify_read_segments(segments: &HashMap<String, Vec<u8>>, read_seq: &Vec<u8
     seg_str
 }
 
-fn process_fastq(filename: &Path, segments: &HashMap<String, Vec<u8>>, len_check: (usize, usize)) -> Vec<SegmentedRead> {
+fn process_fastq(
+    filename: &Path,
+    segments: &HashMap<String, Vec<u8>>,
+    len_check: (usize, usize),
+) -> Vec<SegmentedRead> {
     let mut clean_seqs: Vec<SegmentedRead> = Vec::new();
     let reader = fastq::Reader::from_file(filename).unwrap();
     let mut read_num = 0;
@@ -117,13 +117,13 @@ fn process_fastq(filename: &Path, segments: &HashMap<String, Vec<u8>>, len_check
         // Find the start and end segment in the read (if it isn't found then don't process the
         // read further).
         let start_seq = match segments.get("start") {
-                Some(value) => value,
-                None => panic!("No 'start' segment sequence found."),
+            Some(value) => value,
+            None => panic!("No 'start' segment sequence found."),
         };
         let start_rc_seq = dna::revcomp(start_seq);
         let end_seq = match segments.get("end") {
-                Some(value) => value,
-                None => panic!("No 'end' segment sequence found."),
+            Some(value) => value,
+            None => panic!("No 'end' segment sequence found."),
         };
         let end_rc_seq = dna::revcomp(end_seq);
         // Perform the alignments
@@ -135,9 +135,13 @@ fn process_fastq(filename: &Path, segments: &HashMap<String, Vec<u8>>, len_check
 
         if align_start.score > align_start_rc.score && align_end.score > align_end_rc.score {
             // Read in the correct orientation
-            if align_start.score >= score_threshold(start_seq.len()) && align_end.score >= score_threshold(end_seq.len()) {
-                let clean_seq = cut_reorient_seq(&read_seq, align_start.ystart, align_end.yend, true);
-                let clean_qual = cut_reorient_seq(&read_qual, align_start.ystart, align_end.yend, false);
+            if align_start.score >= score_threshold(start_seq.len())
+                && align_end.score >= score_threshold(end_seq.len())
+            {
+                let clean_seq =
+                    cut_reorient_seq(&read_seq, align_start.ystart, align_end.yend, true);
+                let clean_qual =
+                    cut_reorient_seq(&read_qual, align_start.ystart, align_end.yend, false);
                 let seg_str = classify_read_segments(segments, &clean_seq);
                 let seg_data = SegmentedRead {
                     name: read_name,
@@ -147,12 +151,15 @@ fn process_fastq(filename: &Path, segments: &HashMap<String, Vec<u8>>, len_check
                 };
                 clean_seqs.push(seg_data);
             }
-        }
-        else {
+        } else {
             // Read in the reverse orientation
-            if align_start_rc.score >= score_threshold(start_seq.len()) && align_end_rc.score >= score_threshold(end_seq.len()) {
-                let clean_seq = cut_reorient_seq(&read_seq, align_start_rc.yend, align_end_rc.ystart, true);
-                let clean_qual = cut_reorient_seq(&read_qual, align_start_rc.yend, align_end_rc.ystart, false);
+            if align_start_rc.score >= score_threshold(start_seq.len())
+                && align_end_rc.score >= score_threshold(end_seq.len())
+            {
+                let clean_seq =
+                    cut_reorient_seq(&read_seq, align_start_rc.yend, align_end_rc.ystart, true);
+                let clean_qual =
+                    cut_reorient_seq(&read_qual, align_start_rc.yend, align_end_rc.ystart, false);
                 let seg_str = classify_read_segments(segments, &clean_seq);
                 let seg_data = SegmentedRead {
                     name: read_name,
@@ -183,5 +190,4 @@ fn main() {
         let s = String::from_utf8(r.seq.clone()).unwrap();
         println!("Name: {}\nSequnce: {}\nSegments: {}", r.name, s, r.segments);
     }
-
 }
