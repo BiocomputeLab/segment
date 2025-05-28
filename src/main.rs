@@ -5,15 +5,15 @@
 // when we are compiling.
 #![allow(unused_variables, dead_code)]
 
-use std::env;
-use std::fs::File;
-use std::io::{BufWriter, Write};
-use std::path::Path;
-use std::collections::HashMap;
 use bio;
 use bio::alignment::{pairwise::*, Alignment};
 use bio::alphabets::dna;
 use bio::io::{fasta, fastq};
+use std::collections::HashMap;
+use std::env;
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use std::path::Path;
 
 /// Loads a FASTA file containing the `start` and `end` sequences plus and
 /// other segment sequences that should be used when classifying a read.
@@ -57,7 +57,7 @@ fn cut_reorient_seq(seq: &Vec<u8>, start_idx: usize, end_idx: usize, revcomp: bo
 /// Carry out a semi-global alignment of the segment against a read.
 fn align_segment(segment_seq: &Vec<u8>, read_seq: &Vec<u8>) -> Alignment {
     let score = |a: u8, b: u8| if a == b { 1i32 } else { -1i32 };
-    // gap open score: -5, gap extension score: -1
+    // gap open score: -1, gap extension score: -1
     let mut aligner = Aligner::with_capacity(segment_seq.len(), read_seq.len(), -1, -1, &score);
     let alignment = aligner.semiglobal(segment_seq, read_seq);
     alignment
@@ -66,7 +66,6 @@ fn align_segment(segment_seq: &Vec<u8>, read_seq: &Vec<u8>) -> Alignment {
 /// Calculate a reasonable alignment mapping score to trust that a segment has been found.
 fn score_threshold(read_len: usize) -> i32 {
     let read_len_i32 = read_len as i32;
-    // Threshold is that there is at least a 60% match to the reference
     let min_score = (read_len_i32 as f32 * 0.6) as i32;
     min_score
 }
@@ -190,7 +189,6 @@ fn process_fastq(
 }
 
 /// Main function to process command line arguments and perform the analysis.
-/// TODO: Update to use clap (https://docs.rs/clap/latest/clap/)
 fn main() {
     let args: Vec<String> = env::args().collect();
     let fasta_path = Path::new(&args[1]);
@@ -204,7 +202,6 @@ fn main() {
     let f = File::create(output_path).expect("unable to create file");
     let mut f = BufWriter::new(f);
     for r in clean_seqs {
-        //let s = String::from_utf8(r.seq.clone()).unwrap();
         writeln!(f, "{}\t{}", r.name, r.segments).expect("unable to write");
     }
     f.flush().unwrap();
