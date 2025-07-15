@@ -50,3 +50,5 @@ c689dd31-4e98-4154-ab05-a8b0abed9436    start-attP_Bxb1*-end
 8c19bcd4-b228-4e0d-a257-e5116a0a4322    start-attP_Bxb1*-end
 ...
 ```
+
+This should run very quickly and take less than a minute to run on a standard desktop machine.
