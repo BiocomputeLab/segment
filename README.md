@@ -36,7 +36,7 @@ segment data/refs.fasta data/reads.fastq 500 2000 output.txt
 
 This should generate a file classifying each read in the intput FASTQ data file that passes the read length filtering. The first few lines are:
 
-``
+``tsv
 ad6f445e-17e6-49ce-bf40-67da322006c8    start-attP_Bxb1*-end
 124e2e64-ee6f-4349-972d-58e5a210c264    start-attP_Bxb1*-end
 27bcf6c4-9226-4fa9-af0a-1ed4294d8768    start-end
