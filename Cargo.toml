@@ -1,10 +1,17 @@
 [package]
 name = "segment"
-version = "1.0.0"
+version = "2.0.0"
 edition = "2024"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
+clap = { version = "4.0", features = ["derive"] }
 bio = "1"
-clap = { version = "4.5.9", features = ["derive"] }
+rayon = "1"
+indicatif = "0.17"
+noodles-bam = "0.95.0"
+noodles-sam = "0.90.0"
+flate2 = "1.1.9"
+noodles-bgzf = "0.51.0"
+
+[dev-dependencies]
+tempfile = "3.27.0"
