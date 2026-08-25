@@ -6,7 +6,7 @@
 #![allow(unused_variables, dead_code)]
 
 use bio;
-use bio::alignment::{pairwise::*, Alignment};
+use bio::alignment::{Alignment, pairwise::*};
 use bio::alphabets::dna;
 use bio::io::{fasta, fastq};
 use std::collections::HashMap;
