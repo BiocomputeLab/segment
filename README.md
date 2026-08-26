@@ -1,8 +1,8 @@
 # segment
 
-A flexible analysis tool for classifying the order and orientation of sequence segments in recombinase-based genetic circuitry.
+A flexible analysis tool for classifying the order and orientation of sequence segments in genetic parts, circuits and libraries.
 
-Given a FASTA file of segment sequences (attachment sites, barcodes, promoters, parts — anything you can write down) and a file of long sequencing reads, `segment` aligns every segment against every read and reports, for each read, which segments it contains, in what order, and in what orientation. It was written for nanopore reads of recombinase-based constructs, but nothing about it is specific to that application.
+Given a FASTA file of segment sequences (e.g., attachment sites, barcodes, promoters, parts – anything you can write down) and a file of long sequencing reads, `segment` aligns every segment against every read and reports, for each read, which segments it contains, in what order, and in what orientation. It was written for nanopore reads of recombinase-based constructs, but nothing about it is specific to that application.
 
 ## Installation
 
