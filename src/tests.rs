@@ -55,21 +55,50 @@ fn mutate(seq: &str, positions: &[usize]) -> String {
 }
 
 /// Build the name-to-sequence map the classifier takes.
-fn seg_map(pairs: &[(&str, &str)]) -> HashMap<String, Vec<u8>> {
-    pairs
+fn seg_map(pairs: &[(&str, &str)]) -> HashMap<String, Segment> {
+    seg_map_scored(
+        &pairs
+            .iter()
+            .map(|&(n, s)| (n, s, MIN_SCORE))
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// The same, with an explicit minimum normalised score per segment, for the tests that
+/// care which threshold each one is held to.
+fn seg_map_scored(triples: &[(&str, &str, f32)]) -> HashMap<String, Segment> {
+    triples
         .iter()
-        .map(|(name, seq)| (name.to_string(), seq.as_bytes().to_vec()))
+        .map(|(name, seq, min_norm_score)| {
+            (
+                name.to_string(),
+                Segment {
+                    seq: seq.as_bytes().to_vec(),
+                    min_norm_score: *min_norm_score,
+                },
+            )
+        })
         .collect()
+}
+
+/// Load a segments file at the default threshold, with per-segment scores switched off.
+fn load(path: &Path) -> Result<HashMap<String, Segment>> {
+    load_fasta(path, MIN_SCORE, false)
+}
+
+/// ...and with them switched on.
+fn load_scored(path: &Path) -> Result<HashMap<String, Segment>> {
+    load_fasta(path, MIN_SCORE, true)
 }
 
 /// Classify a read exactly as given, with no start/end anchors supplied.
 fn classify(segments: &[(&str, &str)], read: &str) -> String {
-    classify_read_segments(&seg_map(segments), read.as_bytes(), MIN_SCORE, false)
+    classify_read_segments(&seg_map(segments), read.as_bytes(), false)
 }
 
 /// Classify a read that has already been trimmed to run from 'start' to 'end'.
 fn classify_anchored(segments: &[(&str, &str)], read: &str) -> String {
-    classify_read_segments(&seg_map(segments), read.as_bytes(), MIN_SCORE, true)
+    classify_read_segments(&seg_map(segments), read.as_bytes(), true)
 }
 
 /// `cut_reorient_seq` over strings, for readable expectations.
@@ -122,14 +151,7 @@ fn run(
     circular: bool,
     start_end_segs: bool,
 ) -> Vec<(String, String)> {
-    process_reads(
-        reads,
-        &seg_map(segments),
-        (0, 0),
-        MIN_SCORE,
-        circular,
-        start_end_segs,
-    )
+    process_reads(reads, &seg_map(segments), (0, 0), circular, start_end_segs)
     .unwrap()
     .0
     .into_iter()
@@ -297,7 +319,7 @@ fn unrecognised_gzipped_input_is_rejected() {
 fn missing_files_are_reported_by_name() {
     let dir = TempDir::new().unwrap();
     let missing = dir.path().join("nope.fasta");
-    assert_error(load_fasta(&missing), "Could not open segments file");
+    assert_error(load(&missing), "Could not open segments file");
     assert_error(detect_format(&missing), "Could not open sequences file");
 }
 
@@ -311,10 +333,10 @@ fn segment_definitions_are_loaded_from_fasta() {
     writeln!(f, ">start some description\n{}\n>A\n{}", START, SEG_A).unwrap();
     drop(f);
 
-    let segments = load_fasta(&path).unwrap();
+    let segments = load(&path).unwrap();
     assert_eq!(segments.len(), 2);
-    assert_eq!(segments["start"], START.as_bytes());
-    assert_eq!(segments["A"], SEG_A.as_bytes());
+    assert_eq!(segments["start"].seq, START.as_bytes());
+    assert_eq!(segments["A"].seq, SEG_A.as_bytes());
 }
 
 // ---------------------------------------------------------------------------
@@ -329,8 +351,8 @@ fn empty_segment_sequence_is_rejected() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("refs.fasta");
     write_fasta(&path, &[("start", START), ("broken", ""), ("A", SEG_A)]);
-    assert_error(load_fasta(&path), "Segment 'broken'");
-    assert_error(load_fasta(&path), "has no sequence");
+    assert_error(load(&path), "Segment 'broken'");
+    assert_error(load(&path), "has no sequence");
 }
 
 /// Defence in depth for the same bug: if a zero-length segment reached the classifier
@@ -342,6 +364,50 @@ fn zero_length_segment_does_not_crash_the_classifier() {
     assert_eq!(classify(&[("A", SEG_A), ("empty", "")], &read), "A");
 }
 
+/// A character outside the nucleotide alphabet matches nothing, so a segment carrying
+/// one could never be found. Left alone that is a silently empty result; it is refused
+/// instead, naming the character and where it is.
+#[test]
+fn non_nucleotide_segment_characters_are_rejected() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("refs.fasta");
+    write_fasta(&path, &[("A", SEG_A), ("bad", "ACGTXACGT")]);
+    assert_error(load(&path), "Segment 'bad'");
+    assert_error(load(&path), "has 'X' at position 5");
+}
+
+/// A segment of nothing but N matches perfectly at every position of every read, which
+/// is never a question anyone meant to ask, so it is refused up front.
+#[test]
+fn entirely_ambiguous_segment_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("refs.fasta");
+    write_fasta(&path, &[("A", SEG_A), ("blank", "NNNNNNNNNN")]);
+    assert_error(load(&path), "Segment 'blank'");
+    assert_error(load(&path), "entirely ambiguous");
+}
+
+/// A partly ambiguous segment is fine, though - only every base being ambiguous is not.
+#[test]
+fn partly_ambiguous_segment_is_accepted() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("refs.fasta");
+    write_fasta(&path, &[("A", "NNNNNCGATGCNNNNN")]);
+    assert_eq!(load(&path).unwrap()["A"].seq, b"NNNNNCGATGCNNNNN");
+}
+
+/// An RNA spelling of a segment should find the same reads as the DNA one. U is folded
+/// into T on load rather than in the aligner, because U has no complement of its own and
+/// would otherwise survive reverse complementing unchanged.
+#[test]
+fn uracil_in_a_segment_is_read_as_thymine() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("refs.fasta");
+    let rna = SEG_A.replace('T', "U");
+    write_fasta(&path, &[("A", &rna)]);
+    assert_eq!(load(&path).unwrap()["A"].seq, SEG_A.as_bytes());
+}
+
 /// Two segments sharing a name make it ambiguous which sequence to search for, so
 /// processing stops rather than silently keeping whichever was read last.
 #[test]
@@ -349,7 +415,7 @@ fn duplicate_segment_names_are_rejected() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("refs.fasta");
     write_fasta(&path, &[("A", SEG_A), ("B", SEG_B), ("A", SEG_B)]);
-    assert_error(load_fasta(&path), "Segment 'A' is defined more than once");
+    assert_error(load(&path), "Segment 'A' is defined more than once");
 }
 
 /// A segments file with no records at all cannot classify anything, so say so.
@@ -358,7 +424,7 @@ fn empty_segments_file_is_rejected() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("refs.fasta");
     File::create(&path).unwrap();
-    assert_error(load_fasta(&path), "No segments found");
+    assert_error(load(&path), "No segments found");
 }
 
 /// Sequences are compared as raw bytes, so a lower-case segment would once never match
@@ -373,12 +439,16 @@ fn lowercase_segments_and_reads_are_handled() {
     write_fasta(&refs, &[("A", &SEG_A.to_lowercase()), ("B", SEG_B)]);
     write_fastq(&reads, &[("r", &read.to_lowercase())]);
 
-    let segments = load_fasta(&refs).unwrap();
-    assert_eq!(segments["A"], SEG_A.as_bytes(), "segments are upper-cased");
+    let segments = load(&refs).unwrap();
+    assert_eq!(
+        segments["A"].seq,
+        SEG_A.as_bytes(),
+        "segments are upper-cased"
+    );
     let loaded = load_reads(&reads).unwrap().reads;
     assert_eq!(as_pairs(&loaded), vec![("r".to_string(), read.clone())]);
 
-    let (classified, _) = process_reads(loaded, &segments, (0, 0), MIN_SCORE, false, false).unwrap();
+    let (classified, _) = process_reads(loaded, &segments, (0, 0), false, false).unwrap();
     assert_eq!(classified[0].segments, "A-B");
 }
 
@@ -466,7 +536,7 @@ fn malformed_fastq_records_are_skipped_not_fatal() {
 fn missing_anchor_segments_are_reported_clearly() {
     let segments = seg_map(&[("A", SEG_A)]);
     let reads = vec![raw("r", &construct())];
-    let result = process_reads(reads, &segments, (0, 0), MIN_SCORE, false, true);
+    let result = process_reads(reads, &segments, (0, 0), false, true);
     assert_error(result, "no segment named 'start'");
 }
 
@@ -818,6 +888,550 @@ fn containing_alignment_is_discarded_in_favour_of_better_contained_one() {
 }
 
 // ---------------------------------------------------------------------------
+// Per-segment score thresholds
+// ---------------------------------------------------------------------------
+
+/// Write a segments file and load it with --per-segment-scores on.
+fn load_scored_fasta(dir: &TempDir, records: &[(&str, &str)]) -> Result<HashMap<String, Segment>> {
+    let path = dir.path().join("refs.fasta");
+    write_fasta(&path, records);
+    load_scored(&path)
+}
+
+/// The threshold in square brackets becomes that segment's own, and the brackets are not
+/// part of the name it is reported under. A segment without them takes the global value,
+/// so the two forms can be mixed in one file.
+#[test]
+fn a_bracketed_score_sets_that_segments_threshold_and_leaves_the_name_clean() {
+    let dir = TempDir::new().unwrap();
+    let segments = load_scored_fasta(&dir, &[("A[1.9]", SEG_A), ("B", SEG_B)]).unwrap();
+
+    assert_eq!(segments.len(), 2);
+    assert_eq!(segments["A"].seq, SEG_A.as_bytes());
+    assert_eq!(segments["A"].min_norm_score, 1.9);
+    // B said nothing, so it is held to whatever --min-norm-score was.
+    assert_eq!(segments["B"].min_norm_score, MIN_SCORE);
+}
+
+/// A bracketed value always comes off the name, so a segment is reported under the same
+/// name however the run is configured. Without the flag the value inside is simply not
+/// used, and the segment falls back to the global threshold.
+#[test]
+fn brackets_come_off_the_name_even_without_the_flag() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("refs.fasta");
+    write_fasta(&path, &[("A[1.9]", SEG_A)]);
+
+    let segments = load(&path).unwrap();
+    assert_eq!(segments["A"].seq, SEG_A.as_bytes());
+    assert_eq!(
+        segments["A"].min_norm_score, MIN_SCORE,
+        "1.9 is not applied"
+    );
+    assert!(!segments.contains_key("A[1.9]"));
+
+    // The same file with the flag on: same name, and now the score is used.
+    assert_eq!(load_scored(&path).unwrap()["A"].min_norm_score, 1.9);
+}
+
+/// Without the flag nothing inside the brackets is interpreted, so a bracketed name that
+/// is not a score is dropped rather than rejected. It only has to be a valid score when
+/// the flag says it is going to be read as one.
+#[test]
+fn a_bracketed_value_is_not_validated_unless_it_is_going_to_be_used() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("refs.fasta");
+    write_fasta(&path, &[("gene[human]", SEG_A)]);
+
+    assert_eq!(load(&path).unwrap()["gene"].seq, SEG_A.as_bytes());
+    assert_error(load_scored(&path), "'human' is not a number");
+}
+
+/// Because the brackets come off first, two records differing only inside them are one
+/// segment named twice - with or without the flag.
+#[test]
+fn records_differing_only_inside_the_brackets_are_a_duplicate() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("refs.fasta");
+    write_fasta(&path, &[("A[1.5]", SEG_A), ("A[1.7]", SEG_B)]);
+    assert_error(load(&path), "Segment 'A' is defined more than once");
+    assert_error(load_scored(&path), "Segment 'A' is defined more than once");
+}
+
+/// The threshold reaches classification, which is the whole point. At 20 bp a single
+/// mismatch scores 37, or 1.85 normalised: above 1.8 and below 1.9. One read and one
+/// sequence therefore classify differently depending only on the bracketed score.
+#[test]
+fn a_bracketed_score_decides_whether_a_segment_is_found() {
+    let read = format!("{}{}{}", SPACER, mutate(SEG_A, &[10]), SPACER);
+    assert_hit_above_threshold(SEG_A, &read, (12, 32), 37);
+
+    let classify_at = |min_norm_score: f32| {
+        classify_read_segments(
+            &seg_map_scored(&[("A", SEG_A, min_norm_score)]),
+            read.as_bytes(),
+            false,
+        )
+    };
+    assert_eq!(classify_at(1.8), "A", "37/20 = 1.85 clears 1.8");
+    assert_eq!(classify_at(1.9), "", "...and falls short of 1.9");
+}
+
+/// Segments in one file are found at their own thresholds independently, so a strict
+/// segment and a lenient one can sit side by side in the same read. Both carry one
+/// mismatch and so both score 1.85; only the lenient one is reported.
+#[test]
+fn each_segment_is_found_at_its_own_threshold() {
+    let read = format!(
+        "{}{}{}{}",
+        SPACER,
+        mutate(SEG_A, &[10]),
+        mutate(SEG_B, &[10]),
+        SPACER
+    );
+    let segments = seg_map_scored(&[("strict", SEG_A, 1.9), ("lenient", SEG_B, 1.8)]);
+    assert_eq!(
+        classify_read_segments(&segments, read.as_bytes(), false),
+        "lenient"
+    );
+}
+
+/// Anchors are segments too, so a bracketed score applies to them as well - and to each
+/// anchor separately. A read whose 'start' carries one mismatch is dropped when 'start'
+/// demands 1.9 and kept when it demands 1.8, while 'end' is untouched either way.
+#[test]
+fn a_bracketed_score_applies_to_the_anchors() {
+    let degraded = format!(
+        "{}{}{}{}{}{}",
+        JUNK_5,
+        mutate(START, &[10]),
+        SEG_A,
+        SPACER,
+        END,
+        JUNK_3
+    );
+    let anchored_at = |start_score: f32| {
+        process_reads(
+            vec![raw("read", &degraded)],
+            &seg_map_scored(&[
+                ("start", START, start_score),
+                ("end", END, MIN_SCORE),
+                ("A", SEG_A, MIN_SCORE),
+            ]),
+            (0, 0),
+            false,
+            true,
+        )
+        .unwrap()
+    };
+    let (kept, _) = anchored_at(1.8);
+    assert_eq!(kept.len(), 1, "a degraded start clears 1.8");
+    assert_eq!(kept[0].segments, "start-A-end");
+
+    let (dropped, summary) = anchored_at(1.9);
+    assert!(dropped.is_empty(), "...and falls short of 1.9");
+    assert_eq!(
+        summary.start_anchor_not_found, 1,
+        "the start is what failed"
+    );
+}
+
+/// Brackets that cannot be read as a score are a mistake worth stopping for. Quietly
+/// treating them as part of the name would leave a segment that is never found and no
+/// indication of why.
+///
+/// Each way of getting it wrong gets its own message, because "invalid score" tells you
+/// nothing you did not already know. The table is the specification: the left column is
+/// what a user might write and the right is the phrase that has to come back.
+#[test]
+fn every_way_of_writing_a_bad_score_gets_its_own_message() {
+    let dir = TempDir::new().unwrap();
+    let cases = [
+        ("A[high]", "'high' is not a number"),
+        ("A[1.5.2]", "'1.5.2' is not a number"),
+        ("A[]", "the square brackets are empty"),
+        // NaN parses as a float but is neither too high nor too low, so it is turned away
+        // before the range check, whose advice would make no sense for it.
+        ("A[NaN]", "'NaN' is not a usable score"),
+        ("A[inf]", "'inf' is not a usable score"),
+        // Out of range says what would have happened, not just what the bounds are.
+        ("A[2.5]", "no alignment can score above 2.0"),
+        ("A[-0.5]", "the segment would be found everywhere"),
+        // A score with nothing in front of it names no segment.
+        ("[1.5]", "there is no name in front of the brackets"),
+        // Brackets that were opened and never closed are a typo, not a name.
+        ("A[1.5", "the square bracket is never closed"),
+        (
+            "A[1.5]x",
+            "the score has to come last, but 'x' follows the closing bracket",
+        ),
+    ];
+    for (id, expected) in cases {
+        assert_error(load_scored_fasta(&dir, &[(id, SEG_A)]), expected);
+    }
+    // A FASTA ID is the first word of the header, so an ID with spaces inside the
+    // brackets cannot reach here through a file. The parser still has to handle it.
+    assert_error(
+        parse_segment_name("A[   ]", true),
+        "the square brackets are empty",
+    );
+}
+
+/// Whatever went wrong, the message says which record it was: the raw ID as written, the
+/// file, and the record number. With a malformed bracket there may be no usable name to
+/// report, and in a file of hundreds the number is what makes it findable.
+#[test]
+fn a_bad_score_is_reported_against_the_record_it_came_from() {
+    let dir = TempDir::new().unwrap();
+    let error = load_scored_fasta(&dir, &[("ok", SEG_A), ("B[oops]", SEG_B)]).unwrap_err();
+    assert!(error.contains("Segment 'B[oops]'"), "{error}");
+    assert!(error.contains("refs.fasta"), "{error}");
+    assert!(error.contains("(record 2)"), "{error}");
+}
+
+/// The range is stated as the same 0.0 to 2.0 the global --min-norm-score is held to, so
+/// the two cannot drift apart in a user's head.
+#[test]
+fn a_bad_score_says_how_to_write_a_good_one() {
+    let dir = TempDir::new().unwrap();
+    let error = load_scored_fasta(&dir, &[("A[high]", SEG_A)]).unwrap_err();
+    assert!(error.contains("--per-segment-scores"), "{error}");
+    assert!(error.contains("between 0.0 and 2.0"), "{error}");
+    assert!(error.contains("'SEG1[1.5]'"), "names the syntax: {error}");
+}
+
+/// Scores are reported back as written rather than as the reparsed float, so the message
+/// quotes what is actually in the file.
+#[test]
+fn a_bad_score_is_quoted_as_it_was_written() {
+    let dir = TempDir::new().unwrap();
+    let error = load_scored_fasta(&dir, &[("A[2.50]", SEG_A)]).unwrap_err();
+    assert!(error.contains("'2.50'"), "not reformatted to 2.5: {error}");
+}
+
+/// Writing the syntax and forgetting the flag leaves a segment literally named
+/// 'SEG1[1.5]' that never matches what was meant, with nothing in the run to say why. It
+/// is not an error - the name is legal - but it is worth pointing at.
+#[test]
+fn a_score_written_without_the_flag_is_recognised_as_such() {
+    assert!(looks_like_a_scored_name("SEG1[1.5]"));
+    assert!(looks_like_a_scored_name("SEG1[0]"));
+    // A bracketed name that is not a number is just a name, and must not be flagged.
+    assert!(!looks_like_a_scored_name("gene[human]"));
+    assert!(!looks_like_a_scored_name("SEG1[]"));
+    assert!(!looks_like_a_scored_name("[1.5]"), "no name in front of it");
+    assert!(!looks_like_a_scored_name("SEG1"));
+    assert!(!looks_like_a_scored_name("SEG1[1.5"), "never closed");
+}
+
+/// The warning does not stop the file loading: the segment is still there, named without
+/// its brackets as always, and held to the global threshold because the score it asked
+/// for was not read.
+#[test]
+fn a_score_written_without_the_flag_still_loads() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("refs.fasta");
+    write_fasta(&path, &[("A[1.7]", SEG_A)]);
+    let segments = load(&path).unwrap();
+    assert_eq!(segments["A"].min_norm_score, MIN_SCORE);
+}
+
+/// A name ending in ']' with no '[' anywhere is not a bracket group, so it stays a name
+/// whole. Only a matched pair at the end is taken off.
+#[test]
+fn only_a_closed_trailing_bracket_group_is_taken_off_the_name() {
+    for flag in [false, true] {
+        assert_eq!(
+            parse_segment_name("odd]name]", flag).unwrap(),
+            ("odd]name]".to_string(), None),
+            "with the flag {flag}"
+        );
+    }
+    // The last bracket pair wins, so a name may itself contain brackets.
+    assert_eq!(
+        parse_segment_name("SEG[1][1.5]", true).unwrap(),
+        ("SEG[1]".to_string(), Some(1.5))
+    );
+    // Whitespace inside the brackets is tolerated rather than being a parse failure.
+    assert_eq!(
+        parse_segment_name("SEG[ 1.5 ]", true).unwrap(),
+        ("SEG".to_string(), Some(1.5))
+    );
+    // Without the flag the same ID keeps its name and drops the value unread.
+    assert_eq!(
+        parse_segment_name("SEG[ 1.5 ]", false).unwrap(),
+        ("SEG".to_string(), None)
+    );
+}
+
+/// The ambiguity warning is judged against each segment's own threshold, so raising a
+/// degenerate segment's score is a way to silence it - which is exactly what the warning
+/// suggests doing.
+#[test]
+fn a_raised_threshold_settles_the_ambiguity_warning_for_that_segment() {
+    let mostly_n = format!("{}{}", "N".repeat(16), &SEG_A[16..]);
+    let flagged = |score: f32| -> Vec<String> {
+        degenerate_segments(&seg_map_scored(&[
+            ("vague", &mostly_n, score),
+            ("specific", SEG_A, MIN_SCORE),
+        ]))
+        .into_iter()
+        .map(|(name, _, _)| name)
+        .collect()
+    };
+    // 16 Ns in 20 bases match 85% of random sequence: above the 83% that 1.5 demands...
+    assert_eq!(flagged(MIN_SCORE), vec!["vague"]);
+    // ...and below the 90% that 1.7 demands.
+    assert!(flagged(1.7).is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// IUPAC ambiguity codes
+// ---------------------------------------------------------------------------
+
+// Bases match when the sets of nucleotides they name intersect, so a segment may use an
+// ambiguity code to stand for several bases at once. On plain ACGT that rule is byte
+// equality, which is what every test above this point relies on: those tests passing
+// unchanged is what says nothing about unambiguous segments moved.
+
+/// What each IUPAC code stands for, spelled out here independently of the table in
+/// `main.rs` so the two have to agree rather than being the same statement twice.
+const IUPAC_MEANINGS: [(u8, &str); 15] = [
+    (b'A', "A"),
+    (b'C', "C"),
+    (b'G', "G"),
+    (b'T', "T"),
+    (b'R', "AG"),
+    (b'Y', "CT"),
+    (b'S', "CG"),
+    (b'W', "AT"),
+    (b'K', "GT"),
+    (b'M', "AC"),
+    (b'B', "CGT"),
+    (b'D', "AGT"),
+    (b'H', "ACT"),
+    (b'V', "ACG"),
+    (b'N', "ACGT"),
+];
+
+/// `SEG_A` with an `R` - A or G - where it has an A, so it matches `SEG_A` itself and
+/// the variant carrying a G at that position, and nothing else.
+const SEG_DEGENERATE: &str = "CGRTGCTAGCTACGGATCAT";
+/// The G-carrying read sequence `SEG_DEGENERATE` matches but `SEG_A` does not.
+const SEG_A_VARIANT: &str = "CGGTGCTAGCTACGGATCAT";
+
+/// The match rule over every possible pair of bytes, checked against the meanings above.
+/// Exhaustive because it is cheap: two bytes is 65,536 cases, and the interesting ones
+/// are the edges - lower case, bytes that are not nucleotides at all, and each code
+/// against each of the four bases.
+#[test]
+fn bases_match_exactly_when_the_codes_they_name_share_a_nucleotide() {
+    let permits = |byte: u8| -> Option<&'static str> {
+        IUPAC_MEANINGS
+            .iter()
+            .find(|(code, _)| *code == byte.to_ascii_uppercase())
+            .map(|(_, bases)| *bases)
+    };
+    for query in 0..=u8::MAX {
+        for target in 0..=u8::MAX {
+            let want = match (permits(query), permits(target)) {
+                (Some(a), Some(b)) => a.chars().any(|base| b.contains(base)),
+                // Anything that is not a nucleotide code matches nothing at all, not
+                // even a copy of itself.
+                _ => false,
+            };
+            let got = BASE_MASK[query as usize] & BASE_MASK[target as usize] != 0;
+            assert_eq!(
+                got,
+                want,
+                "{} against {}",
+                query.escape_ascii(),
+                target.escape_ascii()
+            );
+        }
+    }
+}
+
+/// An ambiguity code scores a full match against every base it permits and an ordinary
+/// mismatch against the rest - exactly as if that base had been spelled out. Planting
+/// each of the four bases in turn under an `R` shows both halves of that at once.
+#[test]
+fn an_ambiguity_code_scores_a_full_match_against_the_bases_it_permits() {
+    let segment = format!("R{}", &SEG_A[1..]);
+    for (base, score) in [('A', 40), ('G', 40), ('C', 37), ('T', 37)] {
+        let read = format!("{}{}{}{}", SPACER, base, &SEG_A[1..], SPACER);
+        assert_eq!(
+            only(align(&segment, &read, score)),
+            (score, score as f32 / 20.0, 12, 32),
+            "read carrying {base} under the R"
+        );
+    }
+}
+
+/// The whole point of the feature: one degenerate segment finds both sequences it
+/// stands for, and neither is favoured over the other.
+#[test]
+fn a_degenerate_segment_finds_every_sequence_it_stands_for() {
+    for variant in [SEG_A, SEG_A_VARIANT] {
+        let read = format!("{}{}{}", SPACER, variant, SPACER);
+        assert_eq!(only(align(SEG_DEGENERATE, &read, 40)), (40, 2.0, 12, 32));
+        assert_eq!(classify(&[("A", SEG_DEGENERATE)], &read), "A");
+    }
+}
+
+/// A degenerate segment is still reported once per occurrence, and the two occurrences
+/// need not be the same sequence. This is the repeat handling above meeting ambiguity
+/// codes: nothing about overlap resolution changes, it just has more to resolve.
+#[test]
+fn a_degenerate_segment_is_reported_once_per_occurrence() {
+    let read = format!("{}{}{}", SEG_A, SPACER, SEG_A_VARIANT);
+    assert_hit_above_threshold(SEG_DEGENERATE, &read, (0, 20), 40);
+    assert_hit_above_threshold(SEG_DEGENERATE, &read, (32, 52), 40);
+    assert_eq!(classify(&[("A", SEG_DEGENERATE)], &read), "A-A");
+}
+
+/// Segments are searched on both strands, so a degenerate one has to complement
+/// correctly: R (A or G) must become Y (C or T), not stay R and not fall back to N.
+/// Both variants are found reversed, and starred to say which strand they sit on.
+#[test]
+fn a_degenerate_segment_is_found_on_the_reverse_strand() {
+    for variant in [SEG_A, SEG_A_VARIANT] {
+        let read = format!("{}{}{}", SPACER, rc(variant), SPACER);
+        assert_eq!(classify(&[("A", SEG_DEGENERATE)], &read), "A*");
+    }
+    assert_eq!(rc(SEG_DEGENERATE), "ATGATCCGTAGCTAGCAYCG");
+}
+
+/// An ambiguity code stays a statement about which bases are allowed rather than a
+/// licence to match anything: a base it excludes costs an ordinary mismatch, so the code
+/// buys exactly one base's worth of freedom and no more. C and T are what R rules out.
+#[test]
+fn a_degenerate_segment_still_rejects_the_bases_it_excludes() {
+    for excluded in ['C', 'T'] {
+        let read = format!("{}CG{excluded}TGCTAGCTACGGATCAT{}", SPACER, SPACER);
+        assert_eq!(
+            only(align(SEG_DEGENERATE, &read, 37)),
+            (37, 37.0 / 20.0, 12, 32),
+            "read carrying {excluded} under the R"
+        );
+    }
+    // That one mismatch is enough to decide a read that is otherwise marginal. Three
+    // further mismatches leave a permitted base just above the threshold on 31, while an
+    // excluded one falls just below it on 28 and is not reported at all.
+    let read = |seq: &str| format!("{}{}{}", SPACER, mutate(seq, &[8, 12, 16]), SPACER);
+    assert_eq!(
+        classify(&[("A", SEG_DEGENERATE)], &read(SEG_A_VARIANT)),
+        "A"
+    );
+    assert_eq!(
+        classify(&[("A", SEG_DEGENERATE)], &read("CGCTGCTAGCTACGGATCAT")),
+        ""
+    );
+}
+
+/// Anchors go through a different aligner from the segments, so the rule has to hold
+/// there too: a degenerate `start` trims and orients a read carrying either sequence it
+/// permits, and the segments between the anchors are then reported as usual.
+#[test]
+fn a_degenerate_anchor_trims_and_orients_a_read() {
+    // START with a W - A or T - where it has an A.
+    let degenerate_start = "AGGCWTTCGAGCTTAACGGT";
+    let segments = vec![
+        ("start", degenerate_start),
+        ("end", END),
+        ("A", SEG_A),
+        ("B", SEG_B),
+    ];
+    for variant in [START, "AGGCTTTCGAGCTTAACGGT"] {
+        let body = format!("{}{}{}{}{}", variant, SEG_A, SPACER, SEG_B, END);
+        let read = format!("{}{}{}", JUNK_5, body, JUNK_3);
+        assert_eq!(
+            run(vec![raw("read", &read)], &segments, false, true),
+            expect("read", "start-A-B-end"),
+            "anchor variant {variant}"
+        );
+    }
+}
+
+/// The rule is symmetric, so an N a basecaller left in a read matches whatever the
+/// segment asks for there rather than costing a mismatch. This is a change: before
+/// ambiguity codes were understood, an N in a read mismatched every segment base.
+#[test]
+fn an_ambiguity_code_in_a_read_matches_the_segment_base_it_permits() {
+    let read = format!("{}N{}{}", SPACER, &SEG_A[1..], SPACER);
+    assert_eq!(only(align(SEG_A, &read, 40)), (40, 2.0, 12, 32));
+    assert_eq!(classify(&[("A", SEG_A)], &read), "A");
+}
+
+/// Reads are not validated the way segments are - noisy data is expected, and refusing a
+/// whole file over one stray byte would be hostile - so a character that is not a
+/// nucleotide has to cost that one position and nothing more. In particular it must not
+/// match a copy of itself, which plain byte equality would have let it do.
+#[test]
+fn a_character_that_is_not_a_nucleotide_matches_nothing_in_a_read() {
+    let read = format!("{}X{}{}", SPACER, &SEG_A[1..], SPACER);
+    assert_eq!(only(align(SEG_A, &read, 37)), (37, 37.0 / 20.0, 12, 32));
+    let segment = format!("X{}", &SEG_A[1..]);
+    assert_eq!(only(align(&segment, &read, 37)), (37, 37.0 / 20.0, 12, 32));
+}
+
+/// Ambiguity is free under this scoring - a code matches at full score however many
+/// bases it permits - so a segment can be degenerate enough to clear the threshold on
+/// sequence chosen at random. That is a legitimate thing to search for, so it warns
+/// rather than failing, but it must not pass unremarked.
+///
+/// At the default threshold a segment needs (1.5 + 1) / 3 = 83% of its bases to match,
+/// while an N matches 100% of random bases and a spelled-out base 25%. Sixteen Ns in
+/// twenty bases comes to 85% and is called out; fifteen comes to 81% and is not.
+#[test]
+fn segments_too_ambiguous_for_the_threshold_are_reported() {
+    let mostly_n = format!("{}{}", "N".repeat(16), &SEG_A[16..]);
+    let some_n = format!("{}{}", "N".repeat(15), &SEG_A[15..]);
+    let flagged = |min_norm_score: f32| -> Vec<String> {
+        let segments = seg_map_scored(&[
+            ("A", SEG_A, min_norm_score),
+            ("mostly_n", &mostly_n, min_norm_score),
+            ("some_n", &some_n, min_norm_score),
+        ]);
+        degenerate_segments(&segments)
+            .into_iter()
+            .map(|(name, _, _)| name)
+            .collect()
+    };
+    assert_eq!(flagged(MIN_SCORE), vec!["mostly_n"]);
+    // The check is relative to the threshold, not absolute: drop the threshold far
+    // enough and the milder segment matches random sequence often enough to qualify too.
+    assert_eq!(flagged(0.5), vec!["mostly_n", "some_n"]);
+    // ...and a strict enough threshold clears both.
+    assert!(flagged(2.0).is_empty());
+}
+
+/// The warning reports the chance of matching random sequence, which is what makes it
+/// actionable, so the number has to be right. A segment of nothing but N matches every
+/// base, and one with no ambiguity at all matches a quarter of them.
+#[test]
+fn the_reported_chance_of_a_random_match_is_the_average_over_the_bases() {
+    let all_n = "N".repeat(20);
+    let half_n = format!("{}{}", "N".repeat(10), &SEG_A[10..]);
+    assert_eq!(chance_match_fraction(all_n.as_bytes()), 1.0);
+    assert_eq!(chance_match_fraction(SEG_A.as_bytes()), 0.25);
+    // Ten bases matching everything and ten matching one base in four.
+    assert_eq!(
+        chance_match_fraction(half_n.as_bytes()),
+        (10.0 + 10.0 * 0.25) / 20.0
+    );
+    // Each code in turn, against the bases it permits out of the four.
+    for (code, bases) in IUPAC_MEANINGS {
+        assert_eq!(
+            chance_match_fraction(&[code]),
+            bases.len() as f32 / 4.0,
+            "code {}",
+            code as char
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Anchoring and realignment on the start/end segments
 // ---------------------------------------------------------------------------
 
@@ -1001,7 +1615,7 @@ fn reads_are_filtered_by_length() {
         ]
     };
 
-    let bounded: Vec<_> = process_reads(reads(), &segments, (30, 50), MIN_SCORE, false, false)
+    let bounded: Vec<_> = process_reads(reads(), &segments, (30, 50), false, false)
         .unwrap()
         .0
         .into_iter()
@@ -1009,7 +1623,7 @@ fn reads_are_filtered_by_length() {
         .collect();
     assert_eq!(bounded, vec!["ok"]);
 
-    let unbounded: Vec<_> = process_reads(reads(), &segments, (0, 0), MIN_SCORE, false, false)
+    let unbounded: Vec<_> = process_reads(reads(), &segments, (0, 0), false, false)
         .unwrap()
         .0
         .into_iter()
@@ -1028,6 +1642,12 @@ fn reads_are_filtered_by_length() {
 // forward through two rolling rows instead. The tests below check that this is exactly
 // equivalent and not merely close, by keeping the original implementation as a
 // reference oracle and comparing every field of every alignment it produces.
+//
+// The oracle compares bases with `==` rather than by nucleotide set, so it only speaks
+// for unambiguous input. That is deliberate - it is a copy of the original, not a copy
+// of the current code - and it is why every generator below draws from A/T or ACGT. The
+// IUPAC match rule is checked separately, against its own reference, in the section on
+// ambiguity codes.
 
 /// The original full-matrix implementation, preserved verbatim. Not used in production;
 /// its only purpose is to be compared against.
@@ -1335,7 +1955,7 @@ fn summary_counts_every_read_under_the_right_reason() {
         raw("out_of_order", &rotated_construct()),
     ];
     let (classified, summary) =
-        process_reads(reads, &segments, (10, 200), MIN_SCORE, false, true).unwrap();
+        process_reads(reads, &segments, (10, 200), false, true).unwrap();
 
     assert_eq!(classified.len(), 1);
     assert_eq!(summary.classified, 1);
@@ -1362,7 +1982,7 @@ fn summary_without_anchoring_only_reports_length_rejections() {
         raw("tiny", "ACGT"),
     ];
     let (_, summary) =
-        process_reads(reads, &segments, (10, 200), MIN_SCORE, false, false).unwrap();
+        process_reads(reads, &segments, (10, 200), false, false).unwrap();
     assert_eq!(summary.classified, 1);
     assert_eq!(summary.too_short, 1);
     assert_eq!(summary.start_anchor_not_found, 0);
@@ -1390,11 +2010,94 @@ fn summary_report_omits_categories_that_did_not_occur() {
 }
 
 // ---------------------------------------------------------------------------
+// Classification counts CSV
+// ---------------------------------------------------------------------------
+
+/// Tally the given classifications and render the CSV --counts would write.
+fn counts_csv(classifications: &[&str]) -> String {
+    let mut counts = ClassificationCounts::default();
+    for segments in classifications {
+        counts.count(segments);
+    }
+    counts.render_csv()
+}
+
+/// Every classified read is counted exactly once under the string it produced, and the
+/// rows come out most frequent first so the common result is the one you read.
+#[test]
+fn counts_csv_counts_each_classification_and_leads_with_the_commonest() {
+    let csv = counts_csv(&["start-A-end", "start-B-end", "start-A-end", "start-A-end"]);
+    assert_eq!(csv, "segments,count\nstart-A-end,3\nstart-B-end,1\n");
+    // The counts account for every read handed in, so the file reconciles with the
+    // number of lines in the results.
+    let total: usize = csv
+        .lines()
+        .skip(1)
+        .map(|line| line.rsplit_once(',').unwrap().1.parse::<usize>().unwrap())
+        .sum();
+    assert_eq!(total, 4);
+}
+
+/// Equally common classifications are ordered alphabetically rather than left to the
+/// HashMap, whose iteration order varies between runs. Two runs over the same reads must
+/// produce byte-identical files, or a diff between two conditions is unreadable.
+#[test]
+fn counts_csv_breaks_ties_alphabetically() {
+    let classifications = ["start-C-end", "start-A-end", "start-B-end"];
+    assert_eq!(
+        counts_csv(&classifications),
+        "segments,count\nstart-A-end,1\nstart-B-end,1\nstart-C-end,1\n"
+    );
+    // ...and shuffling the reads does not change the file.
+    let mut reversed = classifications;
+    reversed.reverse();
+    assert_eq!(counts_csv(&reversed), counts_csv(&classifications));
+}
+
+/// A read that was classified but carried no recognisable segments is a real result -
+/// quite different from a read that was dropped - so it gets a row of its own, with an
+/// empty first field.
+#[test]
+fn counts_csv_keeps_reads_that_matched_no_segments() {
+    assert_eq!(
+        counts_csv(&["", "start-A-end", ""]),
+        "segments,count\n,2\nstart-A-end,1\n"
+    );
+}
+
+/// A run that classified nothing still writes a valid CSV rather than an empty file, so
+/// whatever reads it stays a table with no rows instead of failing to parse.
+#[test]
+fn counts_csv_of_nothing_is_the_header_alone() {
+    assert_eq!(counts_csv(&[]), "segments,count\n");
+}
+
+/// Segment names come from FASTA headers, so a comma or a quote in one is unlikely but
+/// perfectly legal. Left alone it would shift every column after it, so fields are
+/// quoted when they have to be and left bare when they do not.
+#[test]
+fn counts_csv_quotes_fields_that_need_it() {
+    assert_eq!(csv_field("start-A-end"), "start-A-end");
+    assert_eq!(csv_field("attB,Tp901"), "\"attB,Tp901\"");
+    assert_eq!(csv_field("attB\"Tp901"), "\"attB\"\"Tp901\"");
+    assert_eq!(csv_field("a,b\"c"), "\"a,b\"\"c\"");
+    // A newline in a name would otherwise end the record early.
+    assert_eq!(csv_field("a\nb"), "\"a\nb\"");
+    // Quoting reaches the rendered file, not just the helper.
+    assert_eq!(
+        counts_csv(&["odd,name-A"]),
+        "segments,count\n\"odd,name-A\",1\n"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Equivalence of the linear-space anchor aligner with the library one
 // ---------------------------------------------------------------------------
 
 /// The anchor aligner replaced a library implementation, so it must reproduce that
-/// aligner's affine gap model exactly: with gap_open and gap_extend both -2 a run of k
+/// aligner's affine gap model exactly. Sequences are drawn from A/T and ACGT because the
+/// library aligner compares bases with `==`, which only agrees with the nucleotide-set
+/// rule on unambiguous input: with gap_open and gap_extend both -2 a run of k
 /// gaps costs -2 - 2k, not -2k. Scores decide whether a read is accepted at all, so they
 /// are checked for exact equality over randomised sequences.
 ///
@@ -1578,7 +2281,7 @@ fn chunked_processing_matches_processing_everything_at_once() {
                 break;
             }
             let (classified, chunk_summary) =
-                process_reads(chunk, &segments, (0, 0), MIN_SCORE, false, true).unwrap();
+                process_reads(chunk, &segments, (0, 0), false, true).unwrap();
             out.extend(classified.into_iter().map(|r| (r.name, r.segments)));
             summary.merge(chunk_summary);
         }

@@ -29,7 +29,7 @@ It should be possible to compile and run `segment` on any system for which `rust
 To run `segment` it has the following usage:
 
 ```sh
-segment --segments REF_FASTA --sequences READS [OPTIONS] --output OUTPUT_FILE
+segment --segments REF_FASTA --sequences READS [OPTIONS] --classifications OUTPUT_FILE
 ```
 
 where `REF_FASTA` is a file containing the reference segments in FASTA format, `READS` is the sequencing data (FASTQ, gzipped FASTQ, or unaligned BAM), and `OUTPUT_FILE` is the filename to write the results to.
@@ -47,10 +47,12 @@ By default every read is classified exactly as it arrives. Passing `-d/--start-e
 
 | Argument | Default | Description |
 |---|---|---|
-| `-o`, `--output <FILE>` | `output.txt` | Where to write the tab-separated results. Overwritten if it exists. |
+| `-o`, `--classifications <FILE>` | `classifications.txt` | Where to write the tab-separated per-read results. Overwritten if it exists. |
+| `--counts <FILE>` | off | Also write a CSV counting how many reads produced each distinct classification. See [Classification counts](#classification-counts). |
 | `-d`, `--start-end-segs` | off | Use the segments named `start` and `end` to anchor, trim and orient each read; they then bound the segment string instead of being reported within it. Reads missing either anchor are dropped. Errors if the segments file has no `start` or `end` record. |
 | `-c`, `--circular` | off | Treat reads as coming from a circular template, so a read that crosses the origin (`end` before `start`) is rotated back into order rather than rejected. Only meaningful together with `-d`. |
 | `-s`, `--min-norm-score <FLOAT>` | `1.5` | Minimum normalised alignment score for a segment to count as found, from `0.0` to `2.0`, where `2.0` is a perfect match. See [Choosing a score threshold](#choosing-a-score-threshold). |
+| `--per-segment-scores` | off | Use each segment's own threshold from square brackets after its name, as in `>SEG1[1.7]`. Segments without brackets use `--min-norm-score`. The brackets are stripped from the name either way. See [Per-segment thresholds](#per-segment-thresholds). |
 | `--min-seq-len <INT>` | `100` | Reads shorter than this are dropped before alignment. Set this and `--max-seq-len` both to `0` to disable length filtering. |
 | `--max-seq-len <INT>` | `100000` | Reads longer than this are dropped before alignment. Must not be less than `--min-seq-len`. |
 | `-t`, `--threads <INT>` | `1` | Reads are classified in parallel across this many threads. |
@@ -66,7 +68,7 @@ To run `segment` on the small example data set provided in the `data` directory,
 ```sh
 segment --segments data/refs.fasta --sequences data/reads.fastq \
         --start-end-segs --min-seq-len 500 --max-seq-len 2000 \
-        --output output.txt
+        --classifications classifications.txt
 ```
 
 This should generate a file classifying each read in the input FASTQ data file that passes the read length filtering and in which both anchors are found. The first few lines are:
@@ -104,12 +106,20 @@ Some further examples:
 
 ```sh
 # Classify reads exactly as they arrive, with no anchoring or trimming.
-segment --segments data/refs.fasta --sequences data/reads.fastq --output output.txt
+segment --segments data/refs.fasta --sequences data/reads.fastq --classifications classifications.txt
+
+# Also write a CSV counting how many reads produced each classification.
+segment --segments data/refs.fasta --sequences data/reads.fastq -d \
+        --classifications results.txt --counts counts.csv
+
+# Take each segment's threshold from its name, as in ">SEG1[1.7]".
+segment --segments scored_refs.fasta --sequences data/reads.fastq -d \
+        --per-segment-scores --classifications classifications.txt
 
 # Treat the construct as circular, using 8 threads and a stricter threshold.
 segment --segments data/refs.fasta --sequences data/reads.fastq \
         --start-end-segs --circular --min-norm-score 1.7 --threads 8 \
-        --output output.txt
+        --classifications classifications.txt
 ```
 
 ## Input files
@@ -134,6 +144,78 @@ GCGAGTTTTTATTTCGTTTATTTCAATTAAGGTAACTAAAAAACTCCTTT
 Sequences are upper-cased on load, so a lower-case or soft-masked FASTA works fine. Segment names must be unique, and every record must have a sequence.
 
 The names `start` and `end` are only special when `-d/--start-end-segs` is given. Without it they are ordinary segments, searched for and reported like any other.
+
+#### Ambiguous bases
+
+Segments may use the full set of IUPAC nucleotide codes, so a single segment can stand for several sequences at once — useful for a degenerate primer, a barcode with a wobble position, or a site that varies between variants:
+
+| Code | Matches | Code | Matches |
+|---|---|---|---|
+| `A` `C` `G` `T` | themselves | `B` | C, G or T |
+| `R` | A or G | `D` | A, G or T |
+| `Y` | C or T | `H` | A, C or T |
+| `S` | C or G | `V` | A, C or G |
+| `W` | A or T | `N` | any base |
+| `K` | G or T | | |
+| `M` | A or C | | |
+
+`U` is accepted and read as `T`, so an RNA spelling finds the same reads as the DNA one.
+
+A code matches when the bases it permits overlap those the read permits, and a match scores the same `+2` whether the base was spelled out or reached through an ambiguity code. So `R` in a segment matches an `A` or a `G` in the read at full score, and costs an ordinary mismatch against a `C` or a `T`. The same rule applies in the other direction: an `N` a basecaller left in a read matches whatever the segment asks for at that position instead of costing a mismatch. Ambiguity codes work in the `start` and `end` anchors too, and are complemented correctly when segments are searched on the reverse strand (`R` becomes `Y`).
+
+Because ambiguity is free under this scoring, a heavily degenerate segment can clear the score threshold on sequence that does not contain it — see [Choosing a score threshold](#choosing-a-score-threshold). A segment whose bases are *all* ambiguous would match at every position of every read, so it is refused outright, as is any segment containing a character that is not a nucleotide code at all.
+
+#### Per-segment thresholds
+
+One threshold rarely suits every segment: a long, distinctive one can afford a loose score, while a short or degenerate one needs a strict one to stay meaningful. With `--per-segment-scores`, a segment can name its own in square brackets after the record ID:
+
+```
+>start
+CTCGGATACCCTTACTCTGTTGAAAACGAATAGATAGGTT
+>attB_Tp901[1.7]
+ATGCCAACACAATTAACATCTCAATCAAGGTAAATGCTTTTTGCTTTTTTTGC
+>attP_Bxb1[1.2]
+GGTTTGTCTGGTCAACCACCGCGGTCTCAGTGGTGTACGGTACAAACC
+>attB_Int5
+GAGCGCCGGATCAGGGAGTGGACGGCCTGGGAGCGCTACACGCTGTGGCTGCGGTCGGTGC
+```
+
+Here `attB_Tp901` is only reported at `1.7` or better and `attP_Bxb1` at `1.2` or better, while `start` and `attB_Int5` say nothing and so use `--min-norm-score`. The value is held to the same `0.0`–`2.0` range as `--min-norm-score`. Anchors are segments like any other, so `>start[1.7]` works and applies to that anchor alone.
+
+**A bracketed value is always taken off the name**, whether or not the flag is given, so a segment is reported under the same name however the run is configured — the output reads `attB_Tp901`, never `attB_Tp901[1.7]`. The flag decides only whether the value inside is *used*. Without it the value is ignored, the segment is held to `--min-norm-score` like any other, and the run says so:
+
+```
+warning: segment 'attB_Tp901[1.7]' in 'refs.fasta' names a minimum normalised score, but
+--per-segment-scores was not given, so it is ignored and the segment is held to
+--min-norm-score like any other. The brackets are dropped from its name either way.
+```
+
+Because the brackets come off before names are compared, `SEG1[1.5]` and `SEG1[1.7]` are one segment asking for two thresholds, and are rejected as a duplicate.
+
+#### When a score cannot be read
+
+With the flag on, the value has to be a usable score. Brackets that cannot be read as one stop the run rather than being folded into the name, since a segment silently renamed is a segment silently never found. Every message names the record it came from — the ID as written, the file, and the record number — and says what specifically was wrong:
+
+```
+error: Segment 'attB_Tp901[high]' in 'refs.fasta' (record 3): 'high' is not a number.
+With --per-segment-scores the square brackets hold that segment's minimum normalised
+score, between 0.0 and 2.0, as in 'SEG1[1.5]'.
+```
+
+| Written as | Reported as |
+|---|---|
+| `SEG1[high]`, `SEG1[1.5.2]` | `'high' is not a number` |
+| `SEG1[]` | `the square brackets are empty` |
+| `SEG1[NaN]`, `SEG1[inf]` | `'NaN' is not a usable score` |
+| `SEG1[2.5]` | `outside the range 0.0 to 2.0 … no alignment can score above 2.0, so the segment could never be found` |
+| `SEG1[-0.5]` | `outside the range 0.0 to 2.0 … every alignment already scores at least 0.0, so the segment would be found everywhere` |
+| `[1.5]` | `there is no name in front of the brackets` |
+| `SEG1[1.5` | `the square bracket is never closed` |
+| `SEG1[1.5]x` | `the score has to come last, but 'x' follows the closing bracket` |
+
+Out-of-range scores say what would have happened rather than repeating the bounds back, and the value is quoted as it was written, so `[2.50]` is reported as `'2.50'` and not reformatted.
+
+Only a *closed* bracket group at the end of the ID counts, so a name ending in `]` with no `[` before it — or one that simply contains brackets, like `SEG[1][1.5]` — keeps everything but the final pair. Without the flag nothing inside the brackets is interpreted at all, so `gene[human]` loads as the segment `gene` rather than being rejected.
 
 ### Reads (`--sequences`)
 
@@ -177,6 +259,30 @@ Results are deterministic: the same input, segments and settings always produce 
 
 While running, a progress bar on stderr shows how much of the file has been consumed, with a running read count and an ETA. It is measured in bytes of the input file, so it works the same for gzipped and BAM input, where the number of reads is not known until the file has been read.
 
+### Classification counts
+
+`--counts <FILE>` writes a second file alongside the per-read results: a CSV counting how many reads produced each distinct segment string. It is an addition, never a substitute — the results file is written exactly as it would have been without the flag.
+
+```sh
+segment --segments refs.fasta --sequences reads.fastq -d \
+        --classifications results.txt --counts counts.csv
+```
+
+```csv
+segments,count
+start-attP_Bxb1*-end,53
+start-attB_Tp901-attB_Int5-end,7
+start-attB_Tp901-attB_Int5-attB_BxB1*-attP_Int5*-attP_Tp901-attP_Bxb1*-end,5
+start-end,4
+start-attB_Int5-attB_BxB1*-attP_Int5*-attP_Tp901-attP_Bxb1*-end,1
+```
+
+Rows are ordered by count, most frequent first, with equal counts ordered alphabetically so that two runs over the same reads produce byte-identical files and a diff between two conditions stays readable.
+
+The counts cover the reads that were *classified*, and so add up to the number of lines in the results file rather than to the number of reads in the input. Reads dropped for their length or for a missing anchor never reach a classification and are accounted for in the [run summary](#run-summary) on stderr instead. A read that was classified but carried no recognisable segments is a real result and gets a row with an empty first field.
+
+A run that classified nothing still writes the header row, so the file is always valid CSV. Fields are quoted where a segment name contains a comma, a quote or a newline.
+
 ## How it works
 
 Each read goes through up to four stages. Reads are streamed through in bounded chunks rather than loaded all at once, so a file larger than memory is fine. Chunks are classified and written in order, which is what keeps the output identical however large the input.
@@ -201,7 +307,7 @@ Without `-d`, this stage is skipped entirely: the read is classified exactly as 
 
 ### 3. Segment alignment
 
-Every segment is aligned against the read in both orientations using a semi-global alignment — the whole segment must align, but it may sit anywhere in the read, and gaps at either end of the read are free. Scoring is `+2` for a match, `-1` for a mismatch, and `-2` for a gap (insertion or deletion).
+Every segment is aligned against the read in both orientations using a semi-global alignment — the whole segment must align, but it may sit anywhere in the read, and gaps at either end of the read are free. Scoring is `+2` for a match, `-1` for a mismatch, and `-2` for a gap (insertion or deletion). Two bases match when the sets of nucleotides they stand for overlap, which for plain `ACGT` is ordinary equality and for [ambiguous bases](#ambiguous-bases) is rather more forgiving.
 
 The **normalised score** is the raw score divided by the segment length, so a perfect match scores `2.0` regardless of how long the segment is. A segment is only considered found where its normalised score reaches `--min-norm-score`.
 
@@ -239,6 +345,24 @@ The looser the threshold, the more spurious hits appear, and the effect grows wi
 
 The default of `1.5` reports nothing on the random control above while still tolerating about one mismatch in six, which suits noisy long reads. Lower it only if you have reason to — very noisy data, or segments long enough that a few percent of chance identity cannot accumulate into a false hit — and whenever you do, sanity-check by running against sequence you know does not contain your segments.
 
+### Setting a threshold per segment
+
+`--min-norm-score` applies to every segment at once, which is a blunt instrument when segments differ in length and specificity. [`--per-segment-scores`](#per-segment-thresholds) lets each one name its own in its FASTA header, so a short or degenerate segment can be held to a strict score without making every other segment strict too. Everything below applies per segment rather than globally once that flag is on.
+
+### Thresholds and ambiguous bases
+
+[Ambiguity codes](#ambiguous-bases) push the same effect the other way. A spelled-out base matches one random base in four, but an `R` matches one in two and an `N` matches every one, so a degenerate segment finds chance matches far more readily than its length suggests. The identity a threshold demands is fixed — `(s + 1) / 3`, so 83% at the default `1.5` — while the identity a segment achieves by luck alone is the average of `bases permitted / 4` across its positions.
+
+When the second figure reaches the first, the segment clears the threshold on random sequence and will be reported almost everywhere. `segment` checks this on startup and names any segment that qualifies:
+
+```
+warning: segment 'wobble_probe' is ambiguous enough to match 85% of random bases, which
+is at or above the 83% identity its minimum normalised score asks for, so expect to find
+it almost anywhere. Use a more specific sequence, or raise the score it is found at.
+```
+
+This is a warning rather than an error, since a mostly degenerate probe is a legitimate thing to search for. Each segment is judged against its own threshold, so giving just that segment a stricter one with [`--per-segment-scores`](#per-segment-thresholds) both silences the warning and fixes what it is warning about, without making every other segment stricter.
+
 ## Run summary
 
 At the end of every run a summary is written to stderr, accounting for every read:
@@ -275,14 +399,14 @@ Anchor-related reasons only arise with `-d/--start-end-segs`. Because the summar
 
 `segment` distinguishes between problems that invalidate the whole run and problems affecting a single record.
 
-**Errors** stop the run, print a message to stderr, and exit with status `1`. These are setup mistakes — a missing or unreadable file, a segments file with duplicate names or an empty record, an aligned BAM, `-d` without `start`/`end` segments, or an out-of-range argument:
+**Errors** stop the run, print a message to stderr, and exit with status `1`. These are setup mistakes — a missing or unreadable file, a `--classifications` or `--counts` path that cannot be created, a segments file with duplicate names, an empty record, a character that is not a nucleotide code, a wholly ambiguous segment, an unreadable per-segment score, an aligned BAM, `-d` without `start`/`end` segments, or an out-of-range argument:
 
 ```
 error: Segment 'attB_Tp901' is defined more than once in 'parts.fasta'. Segment names
 must be unique, otherwise it is ambiguous which sequence should be searched for.
 ```
 
-**Warnings** go to stderr and processing continues. An individual malformed or unusable record is skipped, named where possible, and a summary is printed once the file is read:
+**Warnings** go to stderr and processing continues. On startup, a segment [degenerate enough to match random sequence](#thresholds-and-ambiguous-bases) is named, as is one that [asks for a threshold](#per-segment-thresholds) without `--per-segment-scores` to apply it. An individual malformed or unusable record is skipped, named where possible, and a summary is printed once the file is read:
 
 ```
 warning: skipping malformed read 'ad6f445e' in 'reads.fastq': Incomplete record. ...
