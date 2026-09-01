@@ -37,14 +37,177 @@ const MAX_CHUNK_READS: usize = 100_000;
 /// yields another usable record is a broken file, not a file with a few bad reads.
 const MAX_CONSECUTIVE_BAD_RECORDS: usize = 100;
 
+/// Nucleotide sets, one bit per base. An IUPAC ambiguity code is the union of the bases
+/// it stands for, so two bases match exactly when their sets intersect. On plain ACGT
+/// this is byte equality, which is what the aligners did before ambiguity codes were
+/// understood at all.
+const BASE_A: u8 = 0b0001;
+const BASE_C: u8 = 0b0010;
+const BASE_G: u8 = 0b0100;
+const BASE_T: u8 = 0b1000;
+/// Every base: what `N` permits, and the widest set any code can name.
+const BASE_ANY: u8 = BASE_A | BASE_C | BASE_G | BASE_T;
+
+/// Every IUPAC nucleotide code and the bases it permits. `U` is folded into `T` when
+/// segments are loaded, so it never reaches this table.
+const IUPAC_CODES: [(u8, u8); 15] = [
+    (b'A', BASE_A),
+    (b'C', BASE_C),
+    (b'G', BASE_G),
+    (b'T', BASE_T),
+    (b'R', BASE_A | BASE_G),
+    (b'Y', BASE_C | BASE_T),
+    (b'S', BASE_C | BASE_G),
+    (b'W', BASE_A | BASE_T),
+    (b'K', BASE_G | BASE_T),
+    (b'M', BASE_A | BASE_C),
+    (b'B', BASE_C | BASE_G | BASE_T),
+    (b'D', BASE_A | BASE_G | BASE_T),
+    (b'H', BASE_A | BASE_C | BASE_T),
+    (b'V', BASE_A | BASE_C | BASE_G),
+    (b'N', BASE_ANY),
+];
+
+/// Byte to nucleotide set. Anything that is not an IUPAC code maps to the empty set and
+/// so matches nothing - not even a copy of itself. Segments are rejected on load if they
+/// contain one; reads are not, because a stray character in noisy data should cost that
+/// position and nothing more.
+static BASE_MASK: [u8; 256] = build_base_masks();
+
+/// Build [`BASE_MASK`] at compile time, accepting either case.
+const fn build_base_masks() -> [u8; 256] {
+    let mut masks = [0u8; 256];
+    let mut i = 0;
+    while i < IUPAC_CODES.len() {
+        let code = IUPAC_CODES[i].0;
+        let mask = IUPAC_CODES[i].1;
+        masks[code as usize] = mask;
+        masks[(code + 32) as usize] = mask; // the lower-case spelling
+        i += 1;
+    }
+    masks
+}
+
+/// Encode a sequence as one nucleotide set per base, ready for the aligners.
+fn base_masks(seq: &[u8]) -> Vec<u8> {
+    seq.iter().map(|&base| BASE_MASK[base as usize]).collect()
+}
+
+/// A segment to search for: the sequence, and the normalised score a hit has to reach to
+/// count. The threshold is the global `--min-norm-score` unless the segments file named
+/// a different one for this segment, so nothing downstream has to know which it was.
+#[derive(Debug, Clone)]
+struct Segment {
+    seq: Vec<u8>,
+    min_norm_score: f32,
+}
+
+/// How to write a per-segment score, quoted in most of the messages below.
+const SCORE_SYNTAX: &str = "With --per-segment-scores the square brackets hold that segment's \
+     minimum normalised score, between 0.0 and 2.0, as in 'SEG1[1.5]'.";
+
+/// Split a FASTA record ID into the segment name and the threshold in square brackets
+/// after it: `SEG1[1.5]` is the segment `SEG1`, found at 1.5.
+///
+/// A trailing bracketed value is always taken off the name, so a segment is reported
+/// under the same name however the run is configured. `--per-segment-scores` decides
+/// only whether the value inside is *used*: with the flag it must be a valid score and
+/// becomes that segment's threshold, without it the value is ignored and the segment is
+/// held to the global `--min-norm-score` like any other.
+///
+/// With the flag on, a bracket that cannot be read as a score is a mistake worth stopping
+/// for rather than something to quietly fold into the name: a segment silently renamed is
+/// a segment silently never found, and nothing later in the run would hint at why it went
+/// missing.
+///
+/// Errors are the detail only. `load_fasta` prefixes them with the record they came from.
+fn parse_segment_name(id: &str, per_segment_scores: bool) -> Result<(String, Option<f32>)> {
+    let Some((name, written)) = id.strip_suffix(']').and_then(|rest| rest.rsplit_once('[')) else {
+        // No closed bracket group at the end. With the flag on, a bracket left open is a
+        // typo rather than a name: saying so beats accepting 'SEG1[1.5' as a segment
+        // nothing will ever be found under. Without it there is no syntax to get wrong.
+        if per_segment_scores && let Some(open) = id.rfind('[') {
+            return Err(if id[open..].contains(']') {
+                format!(
+                    "the score has to come last, but '{}' follows the closing bracket. {}",
+                    &id[id.rfind(']').unwrap_or(open) + 1..],
+                    SCORE_SYNTAX
+                )
+            } else {
+                format!("the square bracket is never closed. {SCORE_SYNTAX}")
+            });
+        }
+        return Ok((id.to_string(), None));
+    };
+    // Broken whether or not the brackets are being read: stripping them would leave a
+    // segment with no name at all.
+    if name.is_empty() {
+        return Err(
+            "there is no name in front of the brackets. Write the name first, as in 'SEG1[1.5]'."
+                .to_string(),
+        );
+    }
+    if !per_segment_scores {
+        // The brackets come off regardless, but nothing inside them is interpreted, so
+        // whatever they hold is neither validated nor applied.
+        return Ok((name.to_string(), None));
+    }
+    // Reported back as written rather than as the reparsed float, so a message quotes
+    // what is actually in the file: '2.50' does not come back as '2.5'.
+    let written = written.trim();
+    if written.is_empty() {
+        return Err(format!("the square brackets are empty. {SCORE_SYNTAX}"));
+    }
+    let score: f32 = written
+        .parse()
+        .map_err(|_| format!("'{written}' is not a number. {SCORE_SYNTAX}"))?;
+    // Caught before the range check below, whose advice would otherwise be nonsense: a
+    // NaN is neither too high nor too low, it is simply not a score.
+    if !score.is_finite() {
+        return Err(format!("'{written}' is not a usable score. {SCORE_SYNTAX}"));
+    }
+    if !(0.0..=2.0).contains(&score) {
+        // Which end it fell off says what would have happened had it been allowed, which
+        // is more use than repeating the bounds back.
+        let consequence = if score > 2.0 {
+            "no alignment can score above 2.0, so the segment could never be found"
+        } else {
+            "every alignment already scores at least 0.0, so the segment would be found \
+             everywhere"
+        };
+        return Err(format!(
+            "a minimum normalised score of '{written}' is outside the range 0.0 to 2.0, where 2.0 \
+             is a perfect match - {consequence}."
+        ));
+    }
+    Ok((name.to_string(), Some(score)))
+}
+
+/// Whether a record ID looks like it was meant to name a score, for warning about a
+/// segments file that uses the syntax without the flag that turns it on.
+fn looks_like_a_scored_name(id: &str) -> bool {
+    id.strip_suffix(']')
+        .and_then(|rest| rest.rsplit_once('['))
+        .is_some_and(|(name, score)| !name.is_empty() && score.trim().parse::<f32>().is_ok())
+}
+
 /// Loads a FASTA file containing the `start` and `end` sequences plus and
 /// other segment sequences that should be used when classifying a read.
 ///
 /// Sequences are upper-cased on the way in so that a soft-masked or lower-case FASTA
-/// still matches reads. Every problem here is fatal: a segment that cannot be used is
-/// a mistake in the input, and carrying on would silently change what gets reported.
-fn load_fasta(filename: &Path) -> Result<HashMap<String, Vec<u8>>> {
-    let mut fasta_data: HashMap<String, Vec<u8>> = HashMap::new();
+/// still matches reads, and `U` is folded into `T` so an RNA spelling works too. Every
+/// segment leaves here with a threshold already resolved - its own if the file named
+/// one, `default_min_norm_score` otherwise - so no later stage needs the global value or
+/// has to know which segments overrode it.
+///
+/// Every problem here is fatal: a segment that cannot be used is a mistake in the input,
+/// and carrying on would silently change what gets reported.
+fn load_fasta(
+    filename: &Path,
+    default_min_norm_score: f32,
+    per_segment_scores: bool,
+) -> Result<HashMap<String, Segment>> {
+    let mut fasta_data: HashMap<String, Segment> = HashMap::new();
     // Opened directly rather than via `from_file` so the message carries the actual
     // reason (e.g. "No such file or directory") instead of a generic wrapper.
     let file = File::open(filename)
@@ -58,11 +221,64 @@ fn load_fasta(filename: &Path) -> Result<HashMap<String, Vec<u8>>> {
                 filename.display()
             )
         })?;
-        let seg_name = record.id().to_string();
-        let seg_seq = record.seq().to_ascii_uppercase();
+        // The name is checked for uniqueness after the score is stripped off it, so
+        // 'SEG1[1.5]' and 'SEG1[1.7]' are the same segment asking for two thresholds.
+        //
+        // Failures are reported against the raw ID and the record number rather than the
+        // parsed name, since with a malformed bracket there may not be a usable name yet,
+        // and the record number is what makes it findable in a file of hundreds.
+        let (seg_name, seg_score) =
+            parse_segment_name(record.id(), per_segment_scores).map_err(|detail| {
+                format!(
+                    "Segment '{}' in '{}' (record {}): {detail}",
+                    record.id(),
+                    filename.display(),
+                    index + 1,
+                )
+            })?;
+        // Someone who writes the syntax but forgets the flag gets the threshold they
+        // asked for silently ignored, with nothing in the run to say so. Cheap to spot.
+        if !per_segment_scores && looks_like_a_scored_name(record.id()) {
+            warn(format!(
+                "segment '{}' in '{}' names a minimum normalised score, but --per-segment-scores \
+                 was not given, so it is ignored and the segment is held to --min-norm-score \
+                 like any other. The brackets are dropped from its name either way.",
+                record.id(),
+                filename.display(),
+            ));
+        }
+        let mut seg_seq = record.seq().to_ascii_uppercase();
+        // Done here rather than in the mask table so that reverse complementing stays
+        // correct: `U` has no complement of its own, and would be left as it is.
+        for base in seg_seq.iter_mut() {
+            if *base == b'U' {
+                *base = b'T';
+            }
+        }
         if seg_seq.is_empty() {
             return Err(format!(
                 "Segment '{seg_name}' in '{}' has no sequence. Every segment needs at least one base.",
+                filename.display()
+            ));
+        }
+        // A character outside the alphabet matches nothing, so leaving it in place would
+        // quietly stop the segment ever being found. Say so instead.
+        if let Some(offset) = seg_seq.iter().position(|&b| BASE_MASK[b as usize] == 0) {
+            return Err(format!(
+                "Segment '{seg_name}' in '{}' has '{}' at position {}, which is not a nucleotide. \
+                 Segments may use A, C, G and T, the IUPAC ambiguity codes R, Y, S, W, K, M, B, D, \
+                 H, V and N, or U in place of T.",
+                filename.display(),
+                seg_seq[offset].escape_ascii(),
+                offset + 1,
+            ));
+        }
+        // Every base ambiguous means the segment matches perfectly at every position of
+        // every read, which is never what anyone meant to ask for.
+        if seg_seq.iter().all(|&b| BASE_MASK[b as usize] == BASE_ANY) {
+            return Err(format!(
+                "Segment '{seg_name}' in '{}' is entirely ambiguous, so it would match at every \
+                 position of every read. Give it at least one base that is not N.",
                 filename.display()
             ));
         }
@@ -73,7 +289,13 @@ fn load_fasta(filename: &Path) -> Result<HashMap<String, Vec<u8>>> {
                 filename.display()
             ));
         }
-        fasta_data.insert(seg_name, seg_seq);
+        fasta_data.insert(
+            seg_name,
+            Segment {
+                seq: seg_seq,
+                min_norm_score: seg_score.unwrap_or(default_min_norm_score),
+            },
+        );
     }
     if fasta_data.is_empty() {
         return Err(format!(
@@ -82,6 +304,55 @@ fn load_fasta(filename: &Path) -> Result<HashMap<String, Vec<u8>>> {
         ));
     }
     Ok(fasta_data)
+}
+
+/// Segments ambiguous enough to be found in sequence that does not contain them, each
+/// paired with the fraction of random bases it matches and the fraction its own
+/// threshold demands. Sorted by name.
+///
+/// An ungapped alignment reaching a normalised score of `s` needs a fraction
+/// `(s + 1) / 3` of its bases to match, since a match scores +2 and a mismatch -1. An
+/// ambiguity code matches a random base with probability `|set| / 4`, so when a
+/// segment's average over its bases reaches what the threshold demands, the segment
+/// clears that threshold on sequence picked at random. That is not an error - a mostly
+/// degenerate probe is a legitimate thing to search for - but the results will be full
+/// of it, so it should not come as a surprise.
+fn degenerate_segments(segments: &HashMap<String, Segment>) -> Vec<(String, f32, f32)> {
+    // Segments live in a HashMap whose iteration order varies between runs; sort so the
+    // warnings always come out in the same order.
+    let mut names: Vec<&String> = segments.keys().collect();
+    names.sort();
+    let mut degenerate = Vec::new();
+    for name in names {
+        let segment = &segments[name];
+        // Rejected when the segments file is loaded, but guard anyway: dividing by a
+        // zero length below would give a NaN that compares false against everything.
+        if segment.seq.is_empty() {
+            continue;
+        }
+        // Judged against this segment's own threshold, so a segment that raised its own
+        // to cover its ambiguity is not reported.
+        let required = required_identity(segment.min_norm_score);
+        let chance = chance_match_fraction(&segment.seq);
+        if chance >= required {
+            degenerate.push((name.clone(), chance, required));
+        }
+    }
+    degenerate
+}
+
+/// The fraction of an ungapped segment's bases that must match to reach `min_norm_score`.
+fn required_identity(min_norm_score: f32) -> f32 {
+    (min_norm_score + 1.0) / 3.0
+}
+
+/// How much of a random sequence a segment matches, averaged over its bases. A spelled
+/// out base matches one base in four; an ambiguity code matches as many as it permits.
+fn chance_match_fraction(seq: &[u8]) -> f32 {
+    seq.iter()
+        .map(|&base| BASE_MASK[base as usize].count_ones() as f32 / 4.0)
+        .sum::<f32>()
+        / seq.len() as f32
 }
 
 /// Structure to hold the key sequence and segment information about a read.
@@ -229,6 +500,58 @@ impl RunSummary {
             ));
         }
         out
+    }
+}
+
+/// Tally of how many reads produced each distinct segment string, written as CSV when
+/// `--counts` is given.
+///
+/// Only classified reads are counted. Reads dropped for their length or for a missing
+/// anchor never reach a classification at all and are accounted for in the run summary
+/// on stderr instead. A read that was classified but carried no recognisable segments is
+/// counted under the empty string: that is a real result about that read, and quite
+/// different from the read having been dropped.
+#[derive(Default)]
+struct ClassificationCounts(HashMap<String, usize>);
+
+impl ClassificationCounts {
+    /// Record one classified read.
+    fn count(&mut self, segments: &str) {
+        // Only the strings actually seen are stored, so a run whose reads all classify
+        // differently costs one entry per distinct result and no more.
+        match self.0.get_mut(segments) {
+            Some(seen) => *seen += 1,
+            None => {
+                self.0.insert(segments.to_string(), 1);
+            }
+        }
+    }
+
+    /// Render as CSV, most frequent first and then alphabetically, so that two runs over
+    /// the same reads always produce the same file. A run that classified nothing still
+    /// gets the header row, so the file is always valid CSV.
+    fn render_csv(&self) -> String {
+        let mut rows: Vec<(&String, &usize)> = self.0.iter().collect();
+        rows.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+        let mut csv = String::from("segments,count\n");
+        for (segments, count) in rows {
+            csv.push_str(&csv_field(segments));
+            csv.push(',');
+            csv.push_str(&count.to_string());
+            csv.push('\n');
+        }
+        csv
+    }
+}
+
+/// A CSV field, quoted only when it has to be. Segment names come from FASTA headers, so
+/// a comma or a quote in one is unlikely but perfectly legal, and left as it is would
+/// shift every column after it.
+fn csv_field(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
     }
 }
 
@@ -584,6 +907,9 @@ pub struct AnchorAlignment {
 
 /// Best semi-global alignment of `query` within `target`, in space linear in the target.
 ///
+/// Bases match when their IUPAC nucleotide sets intersect, so an ambiguity code in an
+/// anchor scores a full match against any base it permits. See [`BASE_MASK`].
+///
 /// Mirrors the affine gap model of the library aligner it replaces, where a run of `k`
 /// gaps costs `gap_open + gap_extend * k` - so with both set to -2 a single gap costs -4,
 /// not -2. Three running rows track alignments ending in a match, in a gap in the target,
@@ -592,6 +918,9 @@ fn best_semiglobal(query: &[u8], target: &[u8], scoring: (i32, i32, i32, i32)) -
     let (match_score, mismatch_score, gap_open, gap_extend) = scoring;
     let query_len = query.len();
     let target_len = target.len();
+    // As in `align_multiple`: one pass to encode, then set intersection per cell.
+    let query_masks = base_masks(query);
+    let target_masks = base_masks(target);
     const NEG: i32 = i32::MIN / 4;
 
     // m: ends aligned to a base. i: ends in a gap in the target (query consumed).
@@ -620,9 +949,9 @@ fn best_semiglobal(query: &[u8], target: &[u8], scoring: (i32, i32, i32, i32)) -
         nm_s[0] = 0;
         ni_s[0] = 0;
         nd_s[0] = 0;
-        let query_char = query[qi - 1];
+        let query_mask = query_masks[qi - 1];
         for j in 1..=target_len {
-            let sub = if query_char == target[j - 1] {
+            let sub = if query_mask & target_masks[j - 1] != 0 {
                 match_score
             } else {
                 mismatch_score
@@ -704,8 +1033,18 @@ fn align_segment(segment_seq: &[u8], read_seq: &[u8]) -> bio::alignment::Alignme
     aligner.semiglobal(segment_seq, read_seq)
 }
 
-/// The 'start' and 'end' anchors with their reverse complements, computed once per run.
-type AnchorSeqs = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
+/// The 'start' and 'end' anchors with their reverse complements and the raw score each
+/// has to reach, all computed once per run. The minimums come from each anchor's own
+/// threshold, so an anchor may be held to a different standard from the segments between
+/// them - and from each other.
+struct AnchorSeqs {
+    start: Vec<u8>,
+    start_rc: Vec<u8>,
+    end: Vec<u8>,
+    end_rc: Vec<u8>,
+    start_min: i32,
+    end_min: i32,
+}
 
 /// Work out why an anchored read was rejected.
 ///
@@ -728,10 +1067,12 @@ fn anchor_failure(start_found: bool, end_found: bool) -> Rejected {
 /// so those two bound the segment string instead of being searched for within it.
 /// Without it the read is classified as given and a segment named 'start' or 'end' is
 /// treated like any other.
+///
+/// Each segment is found at its own threshold, resolved when the segments file was
+/// loaded, so there is no global score to apply here.
 fn classify_read_segments(
-    segments: &HashMap<String, Vec<u8>>,
+    segments: &HashMap<String, Segment>,
     read_seq: &[u8],
-    min_norm_score: f32,
     start_end_segs: bool,
 ) -> String {
     let aligner = MultiTracebackAligner::new(
@@ -740,7 +1081,8 @@ fn classify_read_segments(
         -2, // gap score
     );
     let mut all_alignments: Vec<MultiAlignment> = Vec::new();
-    for (seg_name, seg_seq) in segments {
+    for (seg_name, segment) in segments {
+        let seg_seq = &segment.seq;
         if start_end_segs && (seg_name == "start" || seg_name == "end") {
             continue;
         }
@@ -749,7 +1091,7 @@ fn classify_read_segments(
         if seg_seq.is_empty() {
             continue;
         }
-        let min_score = (seg_seq.len() as f32 * min_norm_score) as i32;
+        let min_score = (seg_seq.len() as f32 * segment.min_norm_score) as i32;
         all_alignments.append(&mut aligner.align_multiple(seg_name, seg_seq, read_seq, min_score));
         all_alignments.append(&mut aligner.align_multiple(
             &format!("{}*", seg_name),
@@ -826,15 +1168,14 @@ fn classify_read_segments(
 /// Classify segments across all reads loaded from a sequences file (FASTQ or BAM).
 fn process_reads(
     records: Vec<RawRead>,
-    segments: &HashMap<String, Vec<u8>>,
+    segments: &HashMap<String, Segment>,
     len_check: (usize, usize),
-    min_norm_score: f32,
     circular: bool,
     start_end_segs: bool,
 ) -> Result<(Vec<SegmentedRead>, RunSummary)> {
-    // Precompute start/end revcomps once rather than per-read
+    // Precompute start/end revcomps and score minimums once rather than per-read
     let start_end_seqs: Option<AnchorSeqs> = if start_end_segs {
-        let anchor = |name: &str| -> Result<Vec<u8>> {
+        let anchor = |name: &str| -> Result<Segment> {
             segments.get(name).cloned().ok_or_else(|| {
                 format!(
                     "--start-end-segs was given, but the segments file has no segment named \
@@ -842,11 +1183,16 @@ fn process_reads(
                 )
             })
         };
-        let start_seq = anchor("start")?;
-        let end_seq = anchor("end")?;
-        let start_rc_seq = dna::revcomp(&start_seq);
-        let end_rc_seq = dna::revcomp(&end_seq);
-        Some((start_seq, start_rc_seq, end_seq, end_rc_seq))
+        let start = anchor("start")?;
+        let end = anchor("end")?;
+        Some(AnchorSeqs {
+            start_rc: dna::revcomp(&start.seq),
+            end_rc: dna::revcomp(&end.seq),
+            start_min: (start.seq.len() as f32 * start.min_norm_score) as i32,
+            end_min: (end.seq.len() as f32 * end.min_norm_score) as i32,
+            start: start.seq,
+            end: end.seq,
+        })
     } else {
         None
     };
@@ -868,23 +1214,19 @@ fn process_reads(
             if !start_end_segs {
                 // No anchors: classify the read as it arrived, on whichever strand.
                 let clean_seq = cut_reorient_seq(&read_seq, 0, read_seq.len(), false);
-                let seg_str =
-                    classify_read_segments(segments, &clean_seq, min_norm_score, start_end_segs);
+                let seg_str = classify_read_segments(segments, &clean_seq, start_end_segs);
                 Outcome::Classified(SegmentedRead {
                     name: read_name,
                     segments: seg_str,
                 })
-            } else if let Some((start_seq, start_rc_seq, end_seq, end_rc_seq)) =
-                start_end_seqs.as_ref()
-            {
+            } else if let Some(anchors) = start_end_seqs.as_ref() {
                 let anchor = |seq: &[u8]| best_semiglobal(seq, &read_seq, ANCHOR_SCORING);
-                let align_start = anchor(start_seq);
-                let align_end = anchor(end_seq);
-                let align_start_rc = anchor(start_rc_seq);
-                let align_end_rc = anchor(end_rc_seq);
+                let align_start = anchor(&anchors.start);
+                let align_end = anchor(&anchors.end);
+                let align_start_rc = anchor(&anchors.start_rc);
+                let align_end_rc = anchor(&anchors.end_rc);
 
-                let start_min = (start_seq.len() as f32 * min_norm_score) as i32;
-                let end_min = (end_seq.len() as f32 * min_norm_score) as i32;
+                let (start_min, end_min) = (anchors.start_min, anchors.end_min);
                 if align_start.score > align_start_rc.score && align_end.score > align_end_rc.score
                 {
                     // Read in the correct orientation
@@ -909,12 +1251,7 @@ fn process_reads(
                         }
                         let clean_seq =
                             cut_reorient_seq(&new_read_seq, start_seg_pos, end_seg_pos, false);
-                        let seg_str = classify_read_segments(
-                            segments,
-                            &clean_seq,
-                            min_norm_score,
-                            start_end_segs,
-                        );
+                        let seg_str = classify_read_segments(segments, &clean_seq, start_end_segs);
                         Outcome::Classified(SegmentedRead {
                             name: read_name,
                             segments: seg_str,
@@ -948,12 +1285,7 @@ fn process_reads(
                         }
                         let clean_seq =
                             cut_reorient_seq(&new_read_seq, start_seg_pos, end_seg_pos, true);
-                        let seg_str = classify_read_segments(
-                            segments,
-                            &clean_seq,
-                            min_norm_score,
-                            start_end_segs,
-                        );
+                        let seg_str = classify_read_segments(segments, &clean_seq, start_end_segs);
                         Outcome::Classified(SegmentedRead {
                             name: read_name,
                             segments: seg_str,
@@ -998,7 +1330,7 @@ pub struct MultiAlignment {
 }
 
 /// Semi-global aligner that reports every place a segment matches a read, not just
-/// the best one.
+/// the best one. Matching is by IUPAC nucleotide set, so segments may be degenerate.
 pub struct MultiTracebackAligner {
     match_score: i32,
     mismatch_score: i32,
@@ -1018,6 +1350,9 @@ impl MultiTracebackAligner {
     /// Find every semi-global alignment of `query` within `target` scoring at least
     /// `min_score`, one per end position.
     ///
+    /// Bases match when their IUPAC nucleotide sets intersect, so an ambiguity code in a
+    /// segment scores a full match against any base it permits. See [`BASE_MASK`].
+    ///
     /// Runs in space linear in the target: rather than keep the whole (query x target)
     /// matrix only to trace back where each alignment began, every cell carries that
     /// start position forward, so it falls out of the recurrence directly.
@@ -1034,6 +1369,10 @@ impl MultiTracebackAligner {
     ) -> Vec<MultiAlignment> {
         let query_len = query.len();
         let target_len = target.len();
+        // Encoded once here rather than per cell: the encoding is linear in the sequence
+        // while the matrix below is quadratic, so it disappears into the noise.
+        let query_masks = base_masks(query);
+        let target_masks = base_masks(target);
 
         // Row 0. Leading gaps in the target are free, so every column is a possible
         // start and scores zero.
@@ -1046,9 +1385,9 @@ impl MultiTracebackAligner {
             // Column 0: the query consumed so far is gapped against nothing.
             curr_score[0] = self.gap_score * i as i32;
             curr_start[0] = 0;
-            let query_char = query[i - 1];
+            let query_mask = query_masks[i - 1];
             for j in 1..=target_len {
-                let match_score = if query_char == target[j - 1] {
+                let match_score = if query_mask & target_masks[j - 1] != 0 {
                     self.match_score
                 } else {
                     self.mismatch_score
@@ -1120,9 +1459,17 @@ struct Cli {
     #[arg(short = 'd', long, default_value_t = false)]
     start_end_segs: bool,
 
-    /// Minimum normalised score, between 0.0 and 2.0 (perfect match)
+    /// Minimum normalised score, between 0.0 and 2.0 (perfect match). Applies to every
+    /// segment that does not name its own with --per-segment-scores
     #[arg(short = 's', long, default_value_t = 1.5)]
     min_norm_score: f32,
+
+    /// Read a per-segment minimum normalised score from square brackets after each
+    /// segment's name, so that '>SEG1[1.7]' is the segment 'SEG1' found at 1.7. Segments
+    /// without brackets use --min-norm-score. Without this flag the brackets are part of
+    /// the name, as they were before the option existed
+    #[arg(long, default_value_t = false)]
+    per_segment_scores: bool,
 
     /// Sequences to classify are circular (i.e., from plasmids)
     #[arg(short = 'c', long, default_value_t = false)]
@@ -1132,9 +1479,14 @@ struct Cli {
     #[arg(short = 't', long, default_value_t = 1)]
     threads: usize,
 
-    /// Output file
-    #[arg(short = 'o', long, default_value = "output.txt")]
-    output: String,
+    /// Where to write the per-read classifications
+    #[arg(short = 'o', long, default_value = "classifications.txt")]
+    classifications: String,
+
+    /// Also write a CSV of every distinct classification and how many reads produced it,
+    /// most frequent first
+    #[arg(long)]
+    counts: Option<String>,
 }
 
 /// Run the tool, reporting any failure on stderr and exiting non-zero.
@@ -1172,13 +1524,41 @@ fn run() -> Result<()> {
             )
         })?;
 
-    let segments = load_fasta(Path::new(&cli.segments))?;
+    let segments = load_fasta(
+        Path::new(&cli.segments),
+        cli.min_norm_score,
+        cli.per_segment_scores,
+    )?;
+    for (name, chance, required) in degenerate_segments(&segments) {
+        warn(format!(
+            "segment '{name}' is ambiguous enough to match {:.0}% of random bases, which is at or \
+             above the {:.0}% identity its minimum normalised score asks for, so expect to find it \
+             almost anywhere. Use a more specific sequence, or raise the score it is found at.",
+            chance * 100.0,
+            required * 100.0,
+        ));
+    }
     let sequences = Path::new(&cli.sequences);
     let mut stream = ReadStream::open(sequences)?;
 
-    let f = File::create(Path::new(&cli.output))
-        .map_err(|e| format!("Could not create output file '{}': {e}", cli.output))?;
+    let f = File::create(Path::new(&cli.classifications)).map_err(|e| {
+        format!(
+            "Could not create classifications file '{}': {e}",
+            cli.classifications
+        )
+    })?;
     let mut f = BufWriter::new(f);
+
+    // Created up front alongside the classifications file rather than at the end of the
+    // run, so an unwritable path is reported before the work is done instead of after it.
+    let mut counts_file = match &cli.counts {
+        Some(path) => Some((
+            path.clone(),
+            File::create(Path::new(path))
+                .map_err(|e| format!("Could not create counts file '{path}': {e}"))?,
+        )),
+        None => None,
+    };
 
     // Progress is measured in bytes of the file consumed. That works the same whether the
     // input is plain, gzipped or BAM, and needs no counting pass over the file first.
@@ -1196,6 +1576,7 @@ fn run() -> Result<()> {
     // and rayon preserves order within a chunk, so the output is byte for byte what
     // processing the whole file at once would produce.
     let mut summary = RunSummary::default();
+    let mut classifications = ClassificationCounts::default();
     let mut reads_seen = 0usize;
     loop {
         let chunk = stream.next_chunk(MAX_CHUNK_BASES, MAX_CHUNK_READS)?;
@@ -1207,13 +1588,22 @@ fn run() -> Result<()> {
             chunk,
             &segments,
             (cli.min_seq_len, cli.max_seq_len),
-            cli.min_norm_score,
             cli.circular,
             cli.start_end_segs,
         )?;
         for r in clean_seqs {
-            writeln!(f, "{}\t{}", r.name, r.segments)
-                .map_err(|e| format!("Could not write to output file '{}': {e}", cli.output))?;
+            writeln!(f, "{}\t{}", r.name, r.segments).map_err(|e| {
+                format!(
+                    "Could not write to classifications file '{}': {e}",
+                    cli.classifications
+                )
+            })?;
+            // Counted only when asked for: on a run where every read classifies
+            // differently the tally grows with the input, and there is no reason to pay
+            // for that when no tally was requested.
+            if counts_file.is_some() {
+                classifications.count(&r.segments);
+            }
         }
         summary.merge(chunk_summary);
         // Advanced once the chunk is written, so the bar means "done", not "read ahead".
@@ -1223,8 +1613,17 @@ fn run() -> Result<()> {
     progress.set_position(total_bytes);
     progress.finish_and_clear();
 
-    f.flush()
-        .map_err(|e| format!("Could not finish writing output file '{}': {e}", cli.output))?;
+    f.flush().map_err(|e| {
+        format!(
+            "Could not finish writing classifications file '{}': {e}",
+            cli.classifications
+        )
+    })?;
+
+    if let Some((path, file)) = counts_file.as_mut() {
+        file.write_all(classifications.render_csv().as_bytes())
+            .map_err(|e| format!("Could not write counts file '{path}': {e}"))?;
+    }
 
     report_skipped(stream.skipped, reads_seen, sequences);
     if reads_seen == 0 {
