@@ -93,12 +93,18 @@ fn load_scored(path: &Path) -> Result<HashMap<String, Segment>> {
 
 /// Classify a read exactly as given, with no start/end anchors supplied.
 fn classify(segments: &[(&str, &str)], read: &str) -> String {
-    classify_read_segments(&seg_map(segments), read.as_bytes(), false)
+    segment_string(
+        &classify_read_segments(&seg_map(segments), read.as_bytes(), false),
+        false,
+    )
 }
 
 /// Classify a read that has already been trimmed to run from 'start' to 'end'.
 fn classify_anchored(segments: &[(&str, &str)], read: &str) -> String {
-    classify_read_segments(&seg_map(segments), read.as_bytes(), true)
+    segment_string(
+        &classify_read_segments(&seg_map(segments), read.as_bytes(), true),
+        true,
+    )
 }
 
 /// `cut_reorient_seq` over strings, for readable expectations.
@@ -151,12 +157,44 @@ fn run(
     circular: bool,
     start_end_segs: bool,
 ) -> Vec<(String, String)> {
-    process_reads(reads, &seg_map(segments), (0, 0), circular, start_end_segs)
+    process_reads(
+        reads,
+        &seg_map(segments),
+        (0, 0),
+        circular,
+        start_end_segs,
+        false,
+    )
     .unwrap()
     .0
     .into_iter()
     .map(|r| (r.name, r.segments))
     .collect()
+}
+
+/// The same with --detailed-output on, as (segments, located, extracted sequence) for
+/// the single read the caller passed in.
+fn run_detailed(
+    read: &str,
+    segments: &[(&str, &str)],
+    circular: bool,
+    start_end_segs: bool,
+) -> (String, String, String) {
+    let (mut classified, _) = process_reads(
+        vec![raw("read", read)],
+        &seg_map(segments),
+        (0, 0),
+        circular,
+        start_end_segs,
+        true,
+    )
+    .unwrap();
+    assert_eq!(classified.len(), 1, "the read should have been classified");
+    let r = classified.remove(0);
+    let detail = r
+        .detail
+        .expect("--detailed-output should have filled the detail");
+    (r.segments, detail.located, detail.sequence)
 }
 
 /// The full construct in sequencing orientation: START-A-SPACER-B-END.
@@ -448,7 +486,7 @@ fn lowercase_segments_and_reads_are_handled() {
     let loaded = load_reads(&reads).unwrap().reads;
     assert_eq!(as_pairs(&loaded), vec![("r".to_string(), read.clone())]);
 
-    let (classified, _) = process_reads(loaded, &segments, (0, 0), false, false).unwrap();
+    let (classified, _) = process_reads(loaded, &segments, (0, 0), false, false, false).unwrap();
     assert_eq!(classified[0].segments, "A-B");
 }
 
@@ -536,7 +574,7 @@ fn malformed_fastq_records_are_skipped_not_fatal() {
 fn missing_anchor_segments_are_reported_clearly() {
     let segments = seg_map(&[("A", SEG_A)]);
     let reads = vec![raw("r", &construct())];
-    let result = process_reads(reads, &segments, (0, 0), false, true);
+    let result = process_reads(reads, &segments, (0, 0), false, true, false);
     assert_error(result, "no segment named 'start'");
 }
 
@@ -967,9 +1005,12 @@ fn a_bracketed_score_decides_whether_a_segment_is_found() {
     assert_hit_above_threshold(SEG_A, &read, (12, 32), 37);
 
     let classify_at = |min_norm_score: f32| {
-        classify_read_segments(
-            &seg_map_scored(&[("A", SEG_A, min_norm_score)]),
-            read.as_bytes(),
+        segment_string(
+            &classify_read_segments(
+                &seg_map_scored(&[("A", SEG_A, min_norm_score)]),
+                read.as_bytes(),
+                false,
+            ),
             false,
         )
     };
@@ -991,7 +1032,10 @@ fn each_segment_is_found_at_its_own_threshold() {
     );
     let segments = seg_map_scored(&[("strict", SEG_A, 1.9), ("lenient", SEG_B, 1.8)]);
     assert_eq!(
-        classify_read_segments(&segments, read.as_bytes(), false),
+        segment_string(
+            &classify_read_segments(&segments, read.as_bytes(), false),
+            false
+        ),
         "lenient"
     );
 }
@@ -1021,6 +1065,7 @@ fn a_bracketed_score_applies_to_the_anchors() {
             (0, 0),
             false,
             true,
+            false,
         )
         .unwrap()
     };
@@ -1615,7 +1660,7 @@ fn reads_are_filtered_by_length() {
         ]
     };
 
-    let bounded: Vec<_> = process_reads(reads(), &segments, (30, 50), false, false)
+    let bounded: Vec<_> = process_reads(reads(), &segments, (30, 50), false, false, false)
         .unwrap()
         .0
         .into_iter()
@@ -1623,7 +1668,7 @@ fn reads_are_filtered_by_length() {
         .collect();
     assert_eq!(bounded, vec!["ok"]);
 
-    let unbounded: Vec<_> = process_reads(reads(), &segments, (0, 0), false, false)
+    let unbounded: Vec<_> = process_reads(reads(), &segments, (0, 0), false, false, false)
         .unwrap()
         .0
         .into_iter()
@@ -1955,7 +2000,7 @@ fn summary_counts_every_read_under_the_right_reason() {
         raw("out_of_order", &rotated_construct()),
     ];
     let (classified, summary) =
-        process_reads(reads, &segments, (10, 200), false, true).unwrap();
+        process_reads(reads, &segments, (10, 200), false, true, false).unwrap();
 
     assert_eq!(classified.len(), 1);
     assert_eq!(summary.classified, 1);
@@ -1981,8 +2026,7 @@ fn summary_without_anchoring_only_reports_length_rejections() {
         raw("ok", &format!("{}{}{}", SPACER, SEG_A, SPACER)),
         raw("tiny", "ACGT"),
     ];
-    let (_, summary) =
-        process_reads(reads, &segments, (10, 200), false, false).unwrap();
+    let (_, summary) = process_reads(reads, &segments, (10, 200), false, false, false).unwrap();
     assert_eq!(summary.classified, 1);
     assert_eq!(summary.too_short, 1);
     assert_eq!(summary.start_anchor_not_found, 0);
@@ -2281,7 +2325,7 @@ fn chunked_processing_matches_processing_everything_at_once() {
                 break;
             }
             let (classified, chunk_summary) =
-                process_reads(chunk, &segments, (0, 0), false, true).unwrap();
+                process_reads(chunk, &segments, (0, 0), false, true, false).unwrap();
             out.extend(classified.into_iter().map(|r| (r.name, r.segments)));
             summary.merge(chunk_summary);
         }
@@ -2369,6 +2413,188 @@ fn byte_progress_tracks_the_file_for_every_format() {
             positions.len() - 1
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Detailed output
+// ---------------------------------------------------------------------------
+
+/// Pull the spans out of a located string, which cannot be split on ',' alone because
+/// the separator between entries is also the separator inside the brackets.
+fn located_spans(located: &str) -> Vec<(String, usize, usize)> {
+    if located.is_empty() {
+        return Vec::new();
+    }
+    located
+        .split_inclusive(',')
+        .map(|entry| entry.trim_end_matches(','))
+        // Entries end in ']', so a piece that does not is the first half of one span.
+        .fold(Vec::new(), |mut pieces: Vec<String>, piece| {
+            match pieces.last_mut() {
+                Some(last) if !last.ends_with(']') => {
+                    last.push(',');
+                    last.push_str(piece);
+                }
+                _ => pieces.push(piece.to_string()),
+            }
+            pieces
+        })
+        .iter()
+        .map(|entry| {
+            let (name, span) = entry
+                .split_once('[')
+                .expect("an entry looks like name[a,b]");
+            let (start, end) = span.trim_end_matches(']').split_once(',').unwrap();
+            (
+                name.to_string(),
+                start.parse().unwrap(),
+                end.parse().unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// Without the flag there is no detail to write, so the extra columns cost nothing on a
+/// run that does not ask for them.
+#[test]
+fn the_extra_columns_are_absent_unless_asked_for() {
+    let read = format!("{}{}{}", SPACER, SEG_A, SPACER);
+    let (classified, _) = process_reads(
+        vec![raw("read", &read)],
+        &seg_map(&[("A", SEG_A)]),
+        (0, 0),
+        false,
+        false,
+        false,
+    )
+    .unwrap();
+    assert!(classified[0].detail.is_none());
+    assert_eq!(classified[0].segments, "A");
+}
+
+/// The positions index the sequence written beside them, counting from 1 and including
+/// both ends. Cutting the sequence at the span has to give back the segment.
+#[test]
+fn positions_are_one_based_and_index_the_sequence_column() {
+    let read = format!("{}{}{}", SPACER, SEG_A, SPACER);
+    let (segments, located, sequence) = run_detailed(&read, &[("A", SEG_A)], false, false);
+
+    assert_eq!(segments, "A");
+    // SPACER is 12 bp, so a 20 bp segment planted after it runs from 13 to 32.
+    assert_eq!(located, "A[13,32]");
+    let (_, start, end) = located_spans(&located)[0].clone();
+    assert_eq!(&sequence[start - 1..end], SEG_A, "the span cuts out SEG_A");
+    assert_eq!(end - start + 1, SEG_A.len(), "inclusive of both ends");
+}
+
+/// One entry per occurrence, in read order, comma separated - matching the segment
+/// string beside it name for name.
+#[test]
+fn every_occurrence_gets_its_own_entry_in_read_order() {
+    let read = format!("{}{}{}{}", SEG_A, SPACER, SEG_B, SEG_A);
+    let (segments, located, sequence) =
+        run_detailed(&read, &[("A", SEG_A), ("B", SEG_B)], false, false);
+
+    assert_eq!(segments, "A-B-A");
+    assert_eq!(located, "A[1,20],B[33,52],A[53,72]");
+    let spans = located_spans(&located);
+    assert_eq!(
+        spans
+            .iter()
+            .map(|(name, ..)| name.as_str())
+            .collect::<Vec<_>>(),
+        segments.split('-').collect::<Vec<_>>(),
+        "the two columns name the same segments in the same order"
+    );
+    for (name, start, end) in spans {
+        let expected = if name == "A" { SEG_A } else { SEG_B };
+        assert_eq!(&sequence[start - 1..end], expected, "span for {name}");
+    }
+}
+
+/// A segment found on the reverse strand carries the same trailing '*' it has in the
+/// segment string, and its span still reads along the extracted sequence.
+#[test]
+fn reverse_strand_segments_keep_their_star() {
+    let read = format!("{}{}{}", SPACER, rc(SEG_A), SPACER);
+    let (segments, located, sequence) = run_detailed(&read, &[("A", SEG_A)], false, false);
+
+    assert_eq!(segments, "A*");
+    assert_eq!(located, "A*[13,32]");
+    assert_eq!(
+        &sequence[12..32],
+        rc(SEG_A),
+        "the span cuts out the revcomp"
+    );
+}
+
+/// A read with nothing above threshold has an empty located column rather than a missing
+/// one, so every row still has the same number of columns.
+#[test]
+fn a_read_with_no_segments_has_an_empty_located_column() {
+    let read = SPACER.repeat(3);
+    let (segments, located, sequence) = run_detailed(&read, &[("A", SEG_A)], false, false);
+    assert_eq!((segments.as_str(), located.as_str()), ("", ""));
+    assert_eq!(sequence, read, "the sequence is still written");
+}
+
+/// Without anchors the extracted sequence is the read exactly as it arrived, so the
+/// positions are positions in the read itself.
+#[test]
+fn the_sequence_is_the_whole_read_when_there_are_no_anchors() {
+    let read = format!("{}{}{}", JUNK_5, SEG_A, JUNK_3);
+    let (_, located, sequence) = run_detailed(&read, &[("A", SEG_A)], false, false);
+    assert_eq!(sequence, read);
+    assert_eq!(
+        located, "A[11,30]",
+        "JUNK_5 is 10 bp, so SEG_A starts at 11"
+    );
+}
+
+/// With anchors the extracted sequence is the trimmed span between them, and the
+/// positions count along that rather than along the read as it arrived. The anchors are
+/// left out of the located column: they are its two ends by construction.
+#[test]
+fn the_sequence_is_trimmed_to_the_anchors_and_positions_follow_it() {
+    let read = format!("{}{}{}", JUNK_5, construct(), JUNK_3);
+    let (segments, located, sequence) = run_detailed(&read, &anchored_segments(), false, true);
+
+    assert_eq!(segments, "start-A-B-end");
+    assert_eq!(
+        sequence,
+        construct(),
+        "trimmed to the anchors, junk removed"
+    );
+    // Positions along the construct, not the read: START is 20 bp, so A begins at 21.
+    assert_eq!(located, "A[21,40],B[53,72]");
+    assert_eq!(&sequence[20..40], SEG_A);
+    assert_eq!(&sequence[52..72], SEG_B);
+    assert!(!located.contains("start"), "anchors are omitted: {located}");
+}
+
+/// A read sequenced the other way round is reoriented before classification, so the
+/// sequence column comes out forward and the positions match the forward read exactly.
+/// This is the case where the positions would be wrong if they were taken from the read
+/// as it arrived rather than from the sequence written beside them.
+#[test]
+fn a_reverse_read_is_reoriented_before_its_positions_are_taken() {
+    let forward = format!("{}{}{}", JUNK_5, construct(), JUNK_3);
+    let reverse = rc(&forward);
+    assert_eq!(
+        run_detailed(&reverse, &anchored_segments(), false, true),
+        run_detailed(&forward, &anchored_segments(), false, true),
+        "both strands describe the same construct"
+    );
+}
+
+/// A read that wraps the origin is rotated back into order first, so with --circular the
+/// positions describe the rotated sequence that is written out.
+#[test]
+fn a_wrapped_read_is_rotated_before_its_positions_are_taken() {
+    let (_, located, sequence) =
+        run_detailed(&rotated_construct(), &anchored_segments(), true, true);
+    assert_eq!(sequence, construct(), "rotated back to start-...-end");
+    assert_eq!(located, "A[21,40],B[53,72]");
 }
 
 // ---------------------------------------------------------------------------

@@ -283,6 +283,61 @@ fn cli_rejects_an_unreadable_per_segment_score() {
     );
 }
 
+/// --detailed-output adds two columns to the classifications file: where each segment
+/// sits in the extracted sequence, and that sequence itself. The per-read classification
+/// is unchanged by it, so the flag adds columns rather than altering the existing ones.
+#[test]
+fn cli_detailed_output_adds_positions_and_the_extracted_sequence() {
+    let dir = TempDir::new().unwrap();
+    let refs = dir.path().join("refs.fasta");
+    fs::write(
+        &refs,
+        format!(">start\n{START}\n>end\n{END}\n>A\n{SEG_A}\n>B\n{SEG_B}\n"),
+    )
+    .unwrap();
+
+    // The construct with junk either side, and the same thing sequenced backwards.
+    let construct = format!("{START}{SEG_A}{SEG_B}{END}");
+    let forward = format!("{JUNK}{construct}{JUNK}");
+    let sequences = dir.path().join("reads.fastq");
+    write_fastq(&sequences, &[("fwd", &forward), ("rev", &rc(&forward))]);
+
+    let plain = dir.path().join("plain.txt");
+    run_segment(&refs, &sequences, &plain, &["--start-end-segs"]);
+    assert_eq!(
+        fs::read_to_string(&plain).unwrap(),
+        "fwd\tstart-A-B-end\nrev\tstart-A-B-end\n",
+        "two columns without the flag"
+    );
+
+    let detailed = dir.path().join("detailed.txt");
+    run_segment(
+        &refs,
+        &sequences,
+        &detailed,
+        &["--start-end-segs", "--detailed-output"],
+    );
+    let report = fs::read_to_string(&detailed).unwrap();
+
+    // START is 20 bp, so A runs 21..40 and B 41..60 along the trimmed construct. Both
+    // reads describe it identically, the reverse one having been reoriented first.
+    let expected = format!("start-A-B-end\tA[21,40],B[41,60]\t{construct}");
+    assert_eq!(
+        report,
+        format!("fwd\t{expected}\nrev\t{expected}\n"),
+        "four columns with the flag"
+    );
+
+    // The first two columns are untouched by the flag.
+    let columns = |text: &str, n: usize| -> Vec<String> {
+        text.lines()
+            .map(|line| line.split('\t').take(n).collect::<Vec<_>>().join("\t"))
+            .collect()
+    };
+    let plain_report = fs::read_to_string(&plain).unwrap();
+    assert_eq!(columns(&report, 2), columns(&plain_report, 2));
+}
+
 /// --counts writes a CSV of every distinct classification and how many reads produced
 /// it, alongside the per-read results rather than instead of them. The counts must
 /// reconcile with the results file exactly, since a tally that does not add up to the

@@ -359,6 +359,17 @@ fn chance_match_fraction(seq: &[u8]) -> f32 {
 struct SegmentedRead {
     name: String,
     segments: String,
+    /// Filled only with `--detailed-output`, which is what decides whether the extra
+    /// columns are written. The extracted sequence roughly doubles what a chunk holds
+    /// while it is being written, so it is not carried when nothing will print it.
+    detail: Option<ReadDetail>,
+}
+
+/// The extra columns `--detailed-output` adds: where each segment sits in the extracted
+/// sequence, and that sequence itself.
+struct ReadDetail {
+    located: String,
+    sequence: String,
 }
 
 /// A read name/sequence pair, independent of the input file format it came from.
@@ -1087,12 +1098,21 @@ fn anchor_failure(start_found: bool, end_found: bool) -> Rejected {
     }
 }
 
-/// Classify which segments and their orientations are present within a read.
+/// One segment found in a read: the name it is reported under, with a trailing `*` if it
+/// was found on the reverse strand, and the half-open span of the extracted sequence it
+/// covers.
+struct FoundSegment {
+    name: String,
+    start: usize,
+    end: usize,
+}
+
+/// The segments found in a read, in the order they occur along it.
 ///
 /// With `start_end_segs` the read has already been trimmed to run from 'start' to 'end',
-/// so those two bound the segment string instead of being searched for within it.
-/// Without it the read is classified as given and a segment named 'start' or 'end' is
-/// treated like any other.
+/// so those two are not searched for within it; [`segment_string`] adds them back as the
+/// bounds. Without it the read is classified as given and a segment named 'start' or
+/// 'end' is treated like any other.
 ///
 /// Each segment is found at its own threshold, resolved when the segments file was
 /// loaded, so there is no global score to apply here.
@@ -1100,7 +1120,7 @@ fn classify_read_segments(
     segments: &HashMap<String, Segment>,
     read_seq: &[u8],
     start_end_segs: bool,
-) -> String {
+) -> Vec<FoundSegment> {
     let aligner = MultiTracebackAligner::new(
         2,  // match score
         -1, // mismatch score
@@ -1174,21 +1194,70 @@ fn classify_read_segments(
         }
     }
     all_alignments.sort_by_key(|a| a.target_start);
-    // Generate the segment string, bounded by the anchors only if the user supplied them
+    all_alignments
+        .into_iter()
+        .filter(|aln| !aln.filter)
+        .map(|aln| FoundSegment {
+            name: aln.name,
+            start: aln.target_start,
+            end: aln.target_end,
+        })
+        .collect()
+}
+
+/// The segment string: the names in read order joined by `-`, bounded by the anchors only
+/// if the user supplied them.
+fn segment_string(found: &[FoundSegment], start_end_segs: bool) -> String {
     let mut seg_names: Vec<&str> = Vec::new();
     if start_end_segs {
         seg_names.push("start");
     }
-    for aln in &all_alignments {
-        if aln.filter {
-            continue;
-        }
-        seg_names.push(aln.name.as_str());
-    }
+    seg_names.extend(found.iter().map(|segment| segment.name.as_str()));
     if start_end_segs {
         seg_names.push("end");
     }
     seg_names.join("-")
+}
+
+/// The same segments with the span each covers, as `seg1[1,13],seg2*[15,20]`.
+///
+/// Positions are 1-based and inclusive of both ends, counted along the extracted sequence
+/// written beside them rather than along the read as it arrived - with `--start-end-segs`
+/// the two differ, since the read has been trimmed and possibly reoriented by then.
+///
+/// The anchors are left out even though [`segment_string`] names them: they are the two
+/// ends of the extracted sequence by construction, so a span for them would say nothing
+/// that the sequence itself does not.
+fn located_segment_string(found: &[FoundSegment]) -> String {
+    found
+        .iter()
+        .map(|segment| format!("{}[{},{}]", segment.name, segment.start + 1, segment.end))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Classify one extracted sequence and package it for output.
+///
+/// `clean_seq` is the read as it is actually classified: the whole read when no anchors
+/// were given, and the trimmed, reoriented span between them when they were. That is the
+/// sequence `--detailed-output` writes and the one the positions beside it are counted
+/// along, so the three columns always describe the same thing.
+fn classified_read(
+    read_name: String,
+    clean_seq: &[u8],
+    segments: &HashMap<String, Segment>,
+    start_end_segs: bool,
+    detailed: bool,
+) -> SegmentedRead {
+    let found = classify_read_segments(segments, clean_seq, start_end_segs);
+    SegmentedRead {
+        name: read_name,
+        segments: segment_string(&found, start_end_segs),
+        detail: detailed.then(|| ReadDetail {
+            located: located_segment_string(&found),
+            sequence: String::from_utf8_lossy(clean_seq).into_owned(),
+        }),
+    }
 }
 
 /// Classify segments across all reads loaded from a sequences file (FASTQ or BAM).
@@ -1198,6 +1267,7 @@ fn process_reads(
     len_check: (usize, usize),
     circular: bool,
     start_end_segs: bool,
+    detailed: bool,
 ) -> Result<(Vec<SegmentedRead>, RunSummary)> {
     // Precompute start/end revcomps and score minimums once rather than per-read
     let start_end_seqs: Option<AnchorSeqs> = if start_end_segs {
@@ -1240,11 +1310,13 @@ fn process_reads(
             if !start_end_segs {
                 // No anchors: classify the read as it arrived, on whichever strand.
                 let clean_seq = cut_reorient_seq(&read_seq, 0, read_seq.len(), false);
-                let seg_str = classify_read_segments(segments, &clean_seq, start_end_segs);
-                Outcome::Classified(SegmentedRead {
-                    name: read_name,
-                    segments: seg_str,
-                })
+                Outcome::Classified(classified_read(
+                    read_name,
+                    &clean_seq,
+                    segments,
+                    start_end_segs,
+                    detailed,
+                ))
             } else if let Some(anchors) = start_end_seqs.as_ref() {
                 let anchor = |seq: &[u8]| best_semiglobal(seq, &read_seq, ANCHOR_SCORING);
                 let align_start = anchor(&anchors.start);
@@ -1277,11 +1349,13 @@ fn process_reads(
                         }
                         let clean_seq =
                             cut_reorient_seq(&new_read_seq, start_seg_pos, end_seg_pos, false);
-                        let seg_str = classify_read_segments(segments, &clean_seq, start_end_segs);
-                        Outcome::Classified(SegmentedRead {
-                            name: read_name,
-                            segments: seg_str,
-                        })
+                        Outcome::Classified(classified_read(
+                            read_name,
+                            &clean_seq,
+                            segments,
+                            start_end_segs,
+                            detailed,
+                        ))
                     } else {
                         Outcome::Rejected(anchor_failure(
                             align_start.score.max(align_start_rc.score) >= start_min,
@@ -1311,11 +1385,13 @@ fn process_reads(
                         }
                         let clean_seq =
                             cut_reorient_seq(&new_read_seq, start_seg_pos, end_seg_pos, true);
-                        let seg_str = classify_read_segments(segments, &clean_seq, start_end_segs);
-                        Outcome::Classified(SegmentedRead {
-                            name: read_name,
-                            segments: seg_str,
-                        })
+                        Outcome::Classified(classified_read(
+                            read_name,
+                            &clean_seq,
+                            segments,
+                            start_end_segs,
+                            detailed,
+                        ))
                     } else {
                         Outcome::Rejected(anchor_failure(
                             align_start.score.max(align_start_rc.score) >= start_min,
@@ -1513,6 +1589,11 @@ struct Cli {
     /// most frequent first
     #[arg(long)]
     counts: Option<String>,
+
+    /// Add two columns to the classifications file: where each segment sits in the
+    /// extracted sequence, as 'seg1[1,13],seg2*[15,20]', and that sequence itself
+    #[arg(long, default_value_t = false)]
+    detailed_output: bool,
 }
 
 /// Run the tool, reporting any failure on stderr and exiting non-zero.
@@ -1616,9 +1697,17 @@ fn run() -> Result<()> {
             (cli.min_seq_len, cli.max_seq_len),
             cli.circular,
             cli.start_end_segs,
+            cli.detailed_output,
         )?;
         for r in clean_seqs {
-            writeln!(f, "{}\t{}", r.name, r.segments).map_err(|e| {
+            let row = match &r.detail {
+                Some(detail) => format!(
+                    "{}\t{}\t{}\t{}",
+                    r.name, r.segments, detail.located, detail.sequence
+                ),
+                None => format!("{}\t{}", r.name, r.segments),
+            };
+            writeln!(f, "{row}").map_err(|e| {
                 format!(
                     "Could not write to classifications file '{}': {e}",
                     cli.classifications

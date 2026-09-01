@@ -49,6 +49,7 @@ By default every read is classified exactly as it arrives. Passing `-d/--start-e
 |---|---|---|
 | `-o`, `--classifications <FILE>` | `classifications.txt` | Where to write the tab-separated per-read results. Overwritten if it exists. |
 | `--counts <FILE>` | off | Also write a CSV counting how many reads produced each distinct classification. See [Classification counts](#classification-counts). |
+| `--detailed-output` | off | Add two columns to the classifications file: where each segment sits in the extracted sequence, and that sequence itself. See [Detailed output](#detailed-output). |
 | `-d`, `--start-end-segs` | off | Use the segments named `start` and `end` to anchor, trim and orient each read; they then bound the segment string instead of being reported within it. Reads missing either anchor are dropped. Errors if the segments file has no `start` or `end` record. |
 | `-c`, `--circular` | off | Treat reads as coming from a circular template, so a read that crosses the origin (`end` before `start`) is rotated back into order rather than rejected. Only meaningful together with `-d`. |
 | `-s`, `--min-norm-score <FLOAT>` | `1.5` | Minimum normalised alignment score for a segment to count as found, from `0.0` to `2.0`, where `2.0` is a perfect match. See [Choosing a score threshold](#choosing-a-score-threshold). |
@@ -237,6 +238,8 @@ A tab-separated file with one line per accepted read and no header:
 <read name><TAB><segment string>
 ```
 
+[`--detailed-output`](#detailed-output) adds two more columns to each line.
+
 The segment string lists the segments found, in the order they occur along the read, joined by `-`:
 
 | String | Meaning |
@@ -258,6 +261,28 @@ Note that reads which are filtered out do not appear in the output at all. A rea
 Results are deterministic: the same input, segments and settings always produce byte-identical output, including the order of lines, regardless of `--threads`.
 
 While running, a progress bar on stderr shows how much of the file has been consumed, with a running read count and an ETA. It is measured in bytes of the input file, so it works the same for gzipped and BAM input, where the number of reads is not known until the file has been read.
+
+### Detailed output
+
+`--detailed-output` adds two columns to the same file:
+
+```
+<read name><TAB><segment string><TAB><located segments><TAB><extracted sequence>
+```
+
+```
+read1   start-attB_Tp901-attP_Bxb1*-end   attB_Tp901[21,73],attP_Bxb1*[95,142]   CTCGGATACC…
+```
+
+**Located segments** repeats the segment string with the span each hit covers, `name[start,end]`, comma separated and in the same order. Positions are **1-based and inclusive of both ends**, so `attB_Tp901[21,73]` is 53 bases long and `sequence[21..=73]` cuts it out. Reverse-strand hits keep the same trailing `*` they have in the segment string. A read with no segments above the threshold gets an empty column rather than a missing one, so every row has the same number of columns.
+
+The anchors are left out of this column even though the segment string names them: with `-d` they are the two ends of the extracted sequence by construction, so a span for them would say nothing the sequence does not.
+
+**Extracted sequence** is the read exactly as it was classified — the whole read when no anchors were given, and the trimmed, reoriented span from `start` to `end` (anchors included) when they were. This matters for the positions beside it: with `-d` a read sequenced backwards is reverse complemented before classification, so both strands of the same molecule produce identical positions, counted along the sequence in the column rather than along the read as it arrived.
+
+> **Parsing note.** The separator between entries is a comma, and so is the separator inside the brackets, so splitting the column on `,` alone will not work. Split on `],` instead, or match `([^,\[\]]+)\[(\d+),(\d+)\]`.
+
+Because the extracted sequence is carried alongside each read until its chunk is written, this roughly doubles what a chunk holds in memory. Chunks are bounded, so the ceiling does not grow with the size of the input.
 
 ### Classification counts
 
