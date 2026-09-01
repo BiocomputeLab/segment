@@ -137,7 +137,11 @@ fn cli_default_score_threshold_is_documented_value() {
 fn cli_writes_summary_to_stderr_only() {
     let dir = TempDir::new().unwrap();
     let refs = dir.path().join("refs.fasta");
-    fs::write(&refs, format!(">start\n{START}\n>end\n{END}\n>A\n{SEG_A}\n")).unwrap();
+    fs::write(
+        &refs,
+        format!(">start\n{START}\n>end\n{END}\n>A\n{SEG_A}\n"),
+    )
+    .unwrap();
 
     let sequences = dir.path().join("reads.fastq");
     write_fastq(
@@ -160,14 +164,20 @@ fn cli_writes_summary_to_stderr_only() {
     assert!(result.status.success());
 
     let stderr = String::from_utf8(result.stderr).unwrap();
-    assert!(stderr.contains("Summary"), "no summary on stderr:\n{stderr}");
+    assert!(
+        stderr.contains("Summary"),
+        "no summary on stderr:\n{stderr}"
+    );
     assert!(stderr.contains("classified:"), "{stderr}");
     assert!(
         stderr.contains("neither segment found"),
         "the unanchored read should be reported as a rejection:\n{stderr}"
     );
 
-    assert!(String::from_utf8(result.stdout).unwrap().is_empty(), "stdout must stay clean");
+    assert!(
+        String::from_utf8(result.stdout).unwrap().is_empty(),
+        "stdout must stay clean"
+    );
     // The results file holds only the classified read, with no summary text in it.
     assert_eq!(fs::read_to_string(&output).unwrap(), "good\tstart-A-end\n");
 }
@@ -604,7 +614,12 @@ fn cli_circular_flag_recovers_reads_that_wrap_the_origin() {
     assert_eq!(fs::read_to_string(&linear).unwrap(), "");
 
     let circular = dir.path().join("circular.txt");
-    run_segment(&refs, &sequences, &circular, &["--start-end-segs", "--circular"]);
+    run_segment(
+        &refs,
+        &sequences,
+        &circular,
+        &["--start-end-segs", "--circular"],
+    );
     assert_eq!(
         fs::read_to_string(&circular).unwrap(),
         "wrapped\tstart-A-end\n"

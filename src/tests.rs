@@ -216,7 +216,10 @@ fn expect(name: &str, segments: &str) -> Vec<(String, String)> {
 fn assert_error<T>(result: Result<T>, needle: &str) {
     match result {
         Ok(_) => panic!("expected an error mentioning {needle:?}, but the call succeeded"),
-        Err(e) => assert!(e.contains(needle), "error {e:?} does not mention {needle:?}"),
+        Err(e) => assert!(
+            e.contains(needle),
+            "error {e:?} does not mention {needle:?}"
+        ),
     }
 }
 
@@ -286,10 +289,16 @@ fn all_input_formats_are_detected_and_load_identical_reads() {
     write_bam(&bam_file, &bam_reads);
 
     assert!(matches!(detect_format(&fastq).unwrap(), InputFormat::Fastq));
-    assert!(matches!(detect_format(&gzipped).unwrap(), InputFormat::FastqGz));
+    assert!(matches!(
+        detect_format(&gzipped).unwrap(),
+        InputFormat::FastqGz
+    ));
     // BAM is itself gzip (BGZF) framed, so detection must look past the shared gzip
     // magic bytes at the decompressed "BAM\1" magic to tell it from a gzipped FASTQ.
-    assert!(matches!(detect_format(&bam_file).unwrap(), InputFormat::Bam));
+    assert!(matches!(
+        detect_format(&bam_file).unwrap(),
+        InputFormat::Bam
+    ));
 
     let expected: Vec<_> = reads
         .iter()
@@ -312,7 +321,11 @@ fn bam_reverse_complemented_records_are_restored_to_read_orientation() {
         &bam_file,
         &[
             ("fwd", SEG_A, Flags::UNMAPPED),
-            ("rev", stored.as_str(), Flags::UNMAPPED | Flags::REVERSE_COMPLEMENTED),
+            (
+                "rev",
+                stored.as_str(),
+                Flags::UNMAPPED | Flags::REVERSE_COMPLEMENTED,
+            ),
         ],
     );
 
@@ -717,10 +730,7 @@ fn separated_segments_are_reported_in_read_order() {
 #[test]
 fn reverse_complement_segments_are_starred() {
     let read = format!("{}{}{}", SEG_A, SPACER, rc(SEG_B));
-    assert_eq!(
-        classify(&[("A", SEG_A), ("B", SEG_B)], &read),
-        "A-B*"
-    );
+    assert_eq!(classify(&[("A", SEG_A), ("B", SEG_B)], &read), "A-B*");
 }
 
 /// A segment whose best alignment falls below the score threshold is discarded. The
@@ -888,10 +898,7 @@ fn segments_overlapping_within_tolerance_are_both_kept() {
 fn heavily_overlapping_segments_resolve_to_the_better_alignment() {
     let read = format!("{}GGTTAACC", SEG_A);
     let seg_e = mutate(&read[8..28], &[3, 15]);
-    assert_eq!(
-        classify(&[("A", SEG_A), ("E", seg_e.as_str())], &read),
-        "A"
-    );
+    assert_eq!(classify(&[("A", SEG_A), ("E", seg_e.as_str())], &read), "A");
 }
 
 /// The mirror of the previous case on the identical read: with the two mismatches moved
@@ -1508,9 +1515,7 @@ fn reverse_read_is_reoriented_to_match_the_forward_result() {
 #[test]
 fn read_missing_the_start_anchor_is_dropped() {
     let read = format!("{}{}{}{}{}{}", JUNK_5, SEG_A, SPACER, SEG_B, END, JUNK_3);
-    assert!(
-        run(vec![raw("r", &read)], &anchored_segments(), false, true).is_empty()
-    );
+    assert!(run(vec![raw("r", &read)], &anchored_segments(), false, true).is_empty());
 }
 
 /// An anchor that is present but too degraded to clear the threshold also drops the
@@ -1528,7 +1533,15 @@ fn read_with_a_degraded_anchor_is_dropped_on_either_strand() {
     );
     let forward = format!("{}{}{}", JUNK_5, broken, JUNK_3);
     assert!(run(vec![raw("f", &forward)], &anchored_segments(), false, true).is_empty());
-    assert!(run(vec![raw("r", &rc(&forward))], &anchored_segments(), false, true).is_empty());
+    assert!(
+        run(
+            vec![raw("r", &rc(&forward))],
+            &anchored_segments(),
+            false,
+            true
+        )
+        .is_empty()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1575,7 +1588,12 @@ fn unwrapped_reads_are_unaffected_by_the_circular_flag() {
         expect("r", "start-A-B-end")
     );
     assert_eq!(
-        run(vec![raw("r", &rc(&forward))], &anchored_segments(), true, true),
+        run(
+            vec![raw("r", &rc(&forward))],
+            &anchored_segments(),
+            true,
+            true
+        ),
         expect("r", "start-A-B-end")
     );
 }
@@ -1655,8 +1673,8 @@ fn reads_are_filtered_by_length() {
     let reads = || {
         vec![
             raw("short", SEG_A),                                  // 20 bp
-            raw("ok", &format!("{}{}{}", SPACER, SEG_A, SPACER)),  // 44 bp
-            raw("long", &SEG_A.repeat(5)),                         // 100 bp
+            raw("ok", &format!("{}{}{}", SPACER, SEG_A, SPACER)), // 44 bp
+            raw("long", &SEG_A.repeat(5)),                        // 100 bp
         ]
     };
 
@@ -1839,7 +1857,9 @@ impl Rng {
 
     /// A random sequence of `len` bases drawn from `alphabet`.
     fn seq(&mut self, len: usize, alphabet: &[u8]) -> Vec<u8> {
-        (0..len).map(|_| alphabet[self.below(alphabet.len())]).collect()
+        (0..len)
+            .map(|_| alphabet[self.below(alphabet.len())])
+            .collect()
     }
 }
 
@@ -1888,7 +1908,8 @@ fn linear_space_aligner_matches_reference_exhaustively() {
                 for target in words(target_len) {
                     for min_score in [-20, -4, -1, 0, 1, 2, 4, 6] {
                         let got = aligner.align_multiple("s", &query, &target, min_score);
-                        let want = reference::align_multiple(SCORING, "s", &query, &target, min_score);
+                        let want =
+                            reference::align_multiple(SCORING, "s", &query, &target, min_score);
                         assert_same_alignments(
                             &got,
                             &want,
@@ -1996,7 +2017,10 @@ fn summary_counts_every_read_under_the_right_reason() {
         raw("no_start", &format!("{}{}", SEG_A, END)),
         raw("no_end", &format!("{}{}", START, SEG_A)),
         raw("neither", &SPACER.repeat(3)),
-        raw("opposite_strands", &format!("{}{}{}", START, SEG_A, rc(END))),
+        raw(
+            "opposite_strands",
+            &format!("{}{}{}", START, SEG_A, rc(END)),
+        ),
         raw("out_of_order", &rotated_construct()),
     ];
     let (classified, summary) =
@@ -2014,7 +2038,10 @@ fn summary_counts_every_read_under_the_right_reason() {
 
     assert_eq!(summary.reads(), 8, "every read is accounted for");
     assert_eq!(summary.not_classified(), 7);
-    assert_eq!(summary.classified + summary.not_classified(), summary.reads());
+    assert_eq!(
+        summary.classified + summary.not_classified(),
+        summary.reads()
+    );
 }
 
 /// Without anchoring, no anchor-related rejection can arise, so reads either classify or
@@ -2048,8 +2075,14 @@ fn summary_report_omits_categories_that_did_not_occur() {
     let report = summary.render();
     assert!(report.contains("classified:"));
     assert!(report.contains("read too short"));
-    assert!(!report.contains("read too long"), "zero counts are omitted:\n{report}");
-    assert!(!report.contains("out of order"), "zero counts are omitted:\n{report}");
+    assert!(
+        !report.contains("read too long"),
+        "zero counts are omitted:\n{report}"
+    );
+    assert!(
+        !report.contains("out of order"),
+        "zero counts are omitted:\n{report}"
+    );
     assert!(report.contains("80.0%"), "percentages are shown:\n{report}");
 }
 
@@ -2333,10 +2366,16 @@ fn chunked_processing_matches_processing_everything_at_once() {
     };
 
     let (whole, whole_summary) = classify_all(usize::MAX, usize::MAX);
-    assert!(whole_summary.classified > 0, "the fixture should classify something");
+    assert!(
+        whole_summary.classified > 0,
+        "the fixture should classify something"
+    );
     for (max_bases, max_reads) in [(1, 1), (50, 3), (500, 7)] {
         let (chunked, chunked_summary) = classify_all(max_bases, max_reads);
-        assert_eq!(chunked, whole, "results differ at bounds {max_bases}/{max_reads}");
+        assert_eq!(
+            chunked, whole,
+            "results differ at bounds {max_bases}/{max_reads}"
+        );
         assert_eq!(
             chunked_summary, whole_summary,
             "summary differs at bounds {max_bases}/{max_reads}"
@@ -2371,8 +2410,14 @@ fn byte_progress_tracks_the_file_for_every_format() {
 
     type WriteFixture<'a> = Box<dyn Fn(&Path) + 'a>;
     let writers: [(&str, WriteFixture); 3] = [
-        ("reads.fastq", Box::new(|p: &Path| write_fastq(p, &borrowed))),
-        ("reads.fastq.gz", Box::new(|p: &Path| write_fastq_gz(p, &borrowed))),
+        (
+            "reads.fastq",
+            Box::new(|p: &Path| write_fastq(p, &borrowed)),
+        ),
+        (
+            "reads.fastq.gz",
+            Box::new(|p: &Path| write_fastq_gz(p, &borrowed)),
+        ),
         ("reads.bam", Box::new(|p: &Path| write_bam(p, &bam_reads))),
     ];
     for (name, write_fixture) in writers {
