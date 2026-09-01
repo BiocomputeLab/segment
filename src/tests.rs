@@ -247,6 +247,29 @@ fn write_fastq(path: &Path, reads: &[(&str, &str)]) {
     }
 }
 
+/// Write a FASTA, wrapping the sequence so that multi-line records are exercised.
+fn write_fasta_reads(path: &Path, reads: &[(&str, &str)]) {
+    let mut f = File::create(path).unwrap();
+    for (name, seq) in reads {
+        writeln!(f, ">{name}").unwrap();
+        for line in seq.as_bytes().chunks(7) {
+            writeln!(f, "{}", String::from_utf8_lossy(line)).unwrap();
+        }
+    }
+}
+
+/// Write a gzipped FASTA, likewise wrapped.
+fn write_fasta_gz(path: &Path, reads: &[(&str, &str)]) {
+    let mut encoder = GzEncoder::new(File::create(path).unwrap(), Compression::default());
+    for (name, seq) in reads {
+        writeln!(encoder, ">{name}").unwrap();
+        for line in seq.as_bytes().chunks(7) {
+            writeln!(encoder, "{}", String::from_utf8_lossy(line)).unwrap();
+        }
+    }
+    encoder.finish().unwrap();
+}
+
 /// Write a gzipped FASTQ.
 fn write_fastq_gz(path: &Path, reads: &[(&str, &str)]) {
     let mut encoder = GzEncoder::new(File::create(path).unwrap(), Compression::default());
@@ -285,9 +308,13 @@ fn all_input_formats_are_detected_and_load_identical_reads() {
     let dir = TempDir::new().unwrap();
     let reads = [("r1", SEG_A), ("r2", SEG_B), ("r3", SPACER)];
 
+    let fasta = dir.path().join("reads.fasta");
+    let fasta_gz = dir.path().join("reads.fasta.gz");
     let fastq = dir.path().join("reads.fastq");
     let gzipped = dir.path().join("reads.fastq.gz");
     let bam_file = dir.path().join("reads.bam");
+    write_fasta_reads(&fasta, &reads);
+    write_fasta_gz(&fasta_gz, &reads);
     write_fastq(&fastq, &reads);
     write_fastq_gz(&gzipped, &reads);
     let bam_reads: Vec<_> = reads
@@ -296,6 +323,11 @@ fn all_input_formats_are_detected_and_load_identical_reads() {
         .collect();
     write_bam(&bam_file, &bam_reads);
 
+    assert!(matches!(detect_format(&fasta).unwrap(), InputFormat::Fasta));
+    assert!(matches!(
+        detect_format(&fasta_gz).unwrap(),
+        InputFormat::FastaGz
+    ));
     assert!(matches!(detect_format(&fastq).unwrap(), InputFormat::Fastq));
     assert!(matches!(
         detect_format(&gzipped).unwrap(),
@@ -312,6 +344,10 @@ fn all_input_formats_are_detected_and_load_identical_reads() {
         .iter()
         .map(|(n, s)| (n.to_string(), s.to_string()))
         .collect();
+    // The FASTA fixtures wrap their sequences across lines, so this also checks that a
+    // multi-line record is rejoined rather than read as several short ones.
+    assert_eq!(as_pairs(&load_reads(&fasta).unwrap().reads), expected);
+    assert_eq!(as_pairs(&load_reads(&fasta_gz).unwrap().reads), expected);
     assert_eq!(as_pairs(&load_reads(&fastq).unwrap().reads), expected);
     assert_eq!(as_pairs(&load_reads(&gzipped).unwrap().reads), expected);
     assert_eq!(as_pairs(&load_reads(&bam_file).unwrap().reads), expected);
@@ -352,12 +388,16 @@ fn bam_reverse_complemented_records_are_restored_to_read_orientation() {
 fn unrecognised_input_is_rejected() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("reads.txt");
+    // Neither '>' nor '@' nor the BAM magic: a bare sequence with no headers at all.
     File::create(&path)
         .unwrap()
-        .write_all(b">this is a fasta\nACGT\n")
+        .write_all(b"ACGTACGTACGT\nACGTACGTACGT\n")
         .unwrap();
     assert_error(detect_format(&path), "Could not determine the format of");
     assert_error(detect_format(&path), "reads.txt");
+    // The message lists what would have been accepted.
+    assert_error(detect_format(&path), "FASTA");
+    assert_error(detect_format(&path), "FASTQ");
 }
 
 /// Gzip-framed input that decompresses to neither FASTQ nor BAM is refused as an
@@ -367,7 +407,7 @@ fn unrecognised_gzipped_input_is_rejected() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("reads.gz");
     let mut encoder = GzEncoder::new(File::create(&path).unwrap(), Compression::default());
-    encoder.write_all(b">this is a fasta\nACGT\n").unwrap();
+    encoder.write_all(b"ACGTACGTACGT\nACGTACGTACGT\n").unwrap();
     encoder.finish().unwrap();
     assert_error(detect_format(&path), "gzip-compressed");
 }
@@ -2460,6 +2500,47 @@ fn byte_progress_tracks_the_file_for_every_format() {
             positions.len() - 1
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Length bounds
+// ---------------------------------------------------------------------------
+
+/// Zero means no bound on that side, independently of the other, so a minimum can be set
+/// without having to invent a maximum to go with it. Setting only a minimum used to
+/// reject every read, because a maximum of zero was read as a real upper bound.
+#[test]
+fn a_zero_bound_means_no_bound_on_that_side() {
+    let reads = || {
+        vec![
+            raw("short", &SEG_A[..10]),
+            raw("medium", SEG_A),
+            raw("long", &SEG_A.repeat(3)),
+        ]
+    };
+    let kept = |bounds: (usize, usize)| -> Vec<String> {
+        process_reads(
+            reads(),
+            &seg_map(&[("A", SEG_A)]),
+            bounds,
+            false,
+            false,
+            false,
+        )
+        .unwrap()
+        .0
+        .into_iter()
+        .map(|r| r.name)
+        .collect()
+    };
+    // Both zero: everything is kept, which is what the defaults now give.
+    assert_eq!(kept((0, 0)), vec!["short", "medium", "long"]);
+    // A minimum on its own drops what is below it and nothing else.
+    assert_eq!(kept((20, 0)), vec!["medium", "long"]);
+    // A maximum on its own drops what is above it and nothing else.
+    assert_eq!(kept((0, 20)), vec!["short", "medium"]);
+    // Both together bound from each side.
+    assert_eq!(kept((20, 20)), vec!["medium"]);
 }
 
 // ---------------------------------------------------------------------------

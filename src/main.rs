@@ -2,6 +2,7 @@
 // Author: Thomas E. Gorochowski <tom@chofski.co.uk>
 
 use bio::alphabets::dna;
+use bio::io::fasta::FastaRead;
 use bio::io::fastq::FastqRead;
 use bio::io::{fasta, fastq};
 use clap::Parser;
@@ -827,6 +828,8 @@ impl RunReport {
 
 /// The auto-detected format of a sequences file.
 enum InputFormat {
+    Fasta,
+    FastaGz,
     Fastq,
     FastqGz,
     Bam,
@@ -836,6 +839,8 @@ impl InputFormat {
     /// What to call this format in the run report.
     fn name(&self) -> &'static str {
         match self {
+            InputFormat::Fasta => "FASTA",
+            InputFormat::FastaGz => "gzipped FASTA",
             InputFormat::Fastq => "FASTQ",
             InputFormat::FastqGz => "gzipped FASTQ",
             InputFormat::Bam => "unaligned BAM",
@@ -843,10 +848,13 @@ impl InputFormat {
     }
 }
 
-/// Inspect a file to determine whether it's FASTQ (starts with '@'), gzipped FASTQ, or BAM.
+/// Inspect a file to determine whether it's FASTA (starts with '>'), FASTQ (starts with
+/// '@'), either of those gzipped, or BAM.
+///
 /// BAM is always BGZF-compressed (i.e. gzip-wrapped), so a gzip magic number alone doesn't
-/// distinguish it from a gzipped FASTQ file - the decompressed content is peeked to tell
-/// them apart (BAM starts with the "BAM\1" magic bytes, FASTQ starts with '@').
+/// distinguish it from a gzipped FASTQ or FASTA file - the decompressed content is peeked
+/// to tell them apart (BAM starts with the "BAM\1" magic bytes, FASTQ with '@', FASTA
+/// with '>').
 fn detect_format(filename: &Path) -> Result<InputFormat> {
     let open = |what: &str| {
         File::open(filename).map_err(|e| {
@@ -878,19 +886,23 @@ fn detect_format(filename: &Path) -> Result<InputFormat> {
             Ok(InputFormat::Bam)
         } else if peek_n >= 1 && peek[0] == b'@' {
             Ok(InputFormat::FastqGz)
+        } else if peek_n >= 1 && peek[0] == b'>' {
+            Ok(InputFormat::FastaGz)
         } else {
             Err(format!(
                 "Could not determine the format of '{}'. It is gzip-compressed but its contents are \
-                 neither FASTQ (records start with '@') nor BAM.",
+                 none of FASTQ (records start with '@'), FASTA (records start with '>') or BAM.",
                 filename.display()
             ))
         }
     } else if n >= 1 && magic[0] == b'@' {
         Ok(InputFormat::Fastq)
+    } else if n >= 1 && magic[0] == b'>' {
+        Ok(InputFormat::Fasta)
     } else {
         Err(format!(
             "Could not determine the format of '{}'. Expected FASTQ (records start with '@'), \
-             gzipped FASTQ, or an unaligned BAM.",
+             FASTA (records start with '>'), either of those gzipped, or an unaligned BAM.",
             filename.display()
         ))
     }
@@ -915,6 +927,7 @@ impl<R: Read> Read for CountingReader<R> {
 
 /// The parser behind a `ReadStream`, one per accepted input format.
 enum Source {
+    Fasta(fasta::Reader<std::io::BufReader<Box<dyn Read>>>),
     Fastq(fastq::Reader<std::io::BufReader<Box<dyn Read>>>),
     Bam(Box<bam::io::Reader<bgzf::io::Reader<CountingReader<File>>>>),
 }
@@ -932,6 +945,7 @@ struct ReadStream {
     filename: std::path::PathBuf,
     bytes_read: std::sync::Arc<std::sync::atomic::AtomicU64>,
     record: fastq::Record,
+    fasta_record: fasta::Record,
     bam_record: bam::Record,
     skipped: usize,
     index: usize,
@@ -957,6 +971,15 @@ impl ReadStream {
             };
         let format = detect_format(filename)?;
         let source = match format {
+            InputFormat::Fasta => {
+                let raw: Box<dyn Read> = Box::new(counted(&bytes_read)?);
+                Source::Fasta(fasta::Reader::new(raw))
+            }
+            InputFormat::FastaGz => {
+                let raw: Box<dyn Read> =
+                    Box::new(flate2::read::MultiGzDecoder::new(counted(&bytes_read)?));
+                Source::Fasta(fasta::Reader::new(raw))
+            }
             InputFormat::Fastq => {
                 let raw: Box<dyn Read> = Box::new(counted(&bytes_read)?);
                 Source::Fastq(fastq::Reader::new(raw))
@@ -983,6 +1006,7 @@ impl ReadStream {
             filename: filename.to_path_buf(),
             bytes_read,
             record: fastq::Record::new(),
+            fasta_record: fasta::Record::new(),
             bam_record: bam::Record::default(),
             skipped: 0,
             index: 0,
@@ -1015,6 +1039,59 @@ impl ReadStream {
     /// The next usable read, skipping over any that cannot be used.
     fn next_read(&mut self) -> Result<Option<RawRead>> {
         match &mut self.source {
+            // FASTA carries no qualities, which the classifier never looks at anyway, so
+            // apart from the record type this mirrors the FASTQ branch below exactly.
+            Source::Fasta(reader) => loop {
+                match reader.read(&mut self.fasta_record) {
+                    Ok(()) => {
+                        if self.fasta_record.is_empty() {
+                            return Ok(None);
+                        }
+                        self.index += 1;
+                        self.consecutive_errors = 0;
+                        if self.fasta_record.seq().is_empty() {
+                            warn(format!(
+                                "skipping read '{}' in '{}': it has no sequence",
+                                self.fasta_record.id(),
+                                self.filename.display()
+                            ));
+                            self.skipped += 1;
+                            continue;
+                        }
+                        return Ok(Some(RawRead {
+                            name: self.fasta_record.id().to_string(),
+                            seq: self.fasta_record.seq().to_ascii_uppercase(),
+                        }));
+                    }
+                    Err(e) => {
+                        self.index += 1;
+                        self.skipped += 1;
+                        self.consecutive_errors += 1;
+                        // The name is only known if the parser reached the header line.
+                        if self.fasta_record.id().is_empty() {
+                            warn(format!(
+                                "skipping malformed record {} in '{}': {e}",
+                                self.index,
+                                self.filename.display()
+                            ));
+                        } else {
+                            warn(format!(
+                                "skipping malformed read '{}' in '{}': {e}",
+                                self.fasta_record.id(),
+                                self.filename.display()
+                            ));
+                        }
+                        if self.consecutive_errors >= MAX_CONSECUTIVE_BAD_RECORDS {
+                            return Err(format!(
+                                "Gave up on '{}' after {} malformed records in a row. The file \
+                                 is probably truncated or not FASTA at all.",
+                                self.filename.display(),
+                                self.consecutive_errors
+                            ));
+                        }
+                    }
+                }
+            },
             Source::Fastq(reader) => loop {
                 match reader.read(&mut self.record) {
                     Ok(()) => {
@@ -1532,6 +1609,7 @@ fn classified_read(
 fn process_reads(
     records: Vec<RawRead>,
     segments: &HashMap<String, Segment>,
+    // Minimum and maximum read length, where zero on either side means no bound there.
     len_check: (usize, usize),
     circular: bool,
     start_end_segs: bool,
@@ -1568,10 +1646,12 @@ fn process_reads(
             let read_seq = record.seq.clone();
 
             let read_len = read_seq.len();
-            if len_check != (0, 0) && read_len < len_check.0 {
+            // Zero means no bound on that side, independently of the other, so a
+            // minimum can be set without also having to invent a maximum.
+            if len_check.0 > 0 && read_len < len_check.0 {
                 return Outcome::Rejected(Rejected::TooShort);
             }
-            if len_check != (0, 0) && read_len > len_check.1 {
+            if len_check.1 > 0 && read_len > len_check.1 {
                 return Outcome::Rejected(Rejected::TooLong);
             }
 
@@ -1816,12 +1896,13 @@ struct Cli {
     #[arg(long)]
     sequences: String,
 
-    /// Minimum read length to process
-    #[arg(long, default_value_t = 100)]
+    /// Minimum read length to process. Zero means no minimum, which is the default: no
+    /// read is dropped for its length unless a bound is asked for
+    #[arg(long, default_value_t = 0)]
     min_seq_len: usize,
 
-    /// Maximum read length to process
-    #[arg(long, default_value_t = 100000)]
+    /// Maximum read length to process. Zero means no maximum, which is the default
+    #[arg(long, default_value_t = 0)]
     max_seq_len: usize,
 
     /// Use the 'start' and 'end' segments to anchor, trim and orient each read. They
@@ -1888,7 +1969,9 @@ fn run() -> Result<()> {
             cli.min_norm_score
         ));
     }
-    if cli.min_seq_len > cli.max_seq_len {
+    // Only meaningful when there is an upper bound: with --max-seq-len at its default of
+    // zero there is nothing for the minimum to exceed.
+    if cli.max_seq_len > 0 && cli.min_seq_len > cli.max_seq_len {
         return Err(format!(
             "--min-seq-len ({}) is greater than --max-seq-len ({}), so no read could ever be kept.",
             cli.min_seq_len, cli.max_seq_len

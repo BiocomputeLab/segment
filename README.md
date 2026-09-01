@@ -32,7 +32,7 @@ To run `segment` it has the following usage:
 segment --segments REF_FASTA --sequences READS [OPTIONS] --classifications OUTPUT_FILE
 ```
 
-where `REF_FASTA` is a file containing the reference segments in FASTA format, `READS` is the sequencing data (FASTQ, gzipped FASTQ, or unaligned BAM), and `OUTPUT_FILE` is the filename to write the results to.
+where `REF_FASTA` is a file containing the reference segments in FASTA format, `READS` is the sequencing data (FASTA, FASTQ, either of those gzipped, or unaligned BAM), and `OUTPUT_FILE` is the filename to write the results to.
 
 By default every read is classified exactly as it arrives. Passing `-d/--start-end-segs` instead uses the segments named `start` and `end` to anchor each read: reads are oriented, trimmed to the region between the two anchors, and dropped if either anchor is missing. This is usually what you want when the reads contain adapters or other flanking sequence.
 
@@ -41,7 +41,7 @@ By default every read is classified exactly as it arrives. Passing `-d/--start-e
 | Argument | Description |
 |---|---|
 | `--segments <FILE>` | FASTA file of segment sequences to search for, one record per segment. Record IDs become the names used in the output. Names must be unique and no record may be empty. |
-| `--sequences <FILE>` | Reads to classify: FASTQ, gzipped FASTQ, or unaligned BAM. The format is detected from the file contents, so the extension is irrelevant. |
+| `--sequences <FILE>` | Reads to classify: FASTA, FASTQ, either of those gzipped, or unaligned BAM. The format is detected from the file contents, so the extension is irrelevant. |
 
 ### Optional arguments
 
@@ -54,8 +54,8 @@ By default every read is classified exactly as it arrives. Passing `-d/--start-e
 | `-c`, `--circular` | off | Treat reads as coming from a circular template, so a read that crosses the origin (`end` before `start`) is rotated back into order rather than rejected. Only meaningful together with `-d`. |
 | `-s`, `--min-norm-score <FLOAT>` | `1.5` | Minimum normalised alignment score for a segment to count as found, from `0.0` to `2.0`, where `2.0` is a perfect match. See [Choosing a score threshold](#choosing-a-score-threshold). |
 | `--per-segment-scores` | off | Use each segment's own threshold from square brackets after its name, as in `>SEG1[1.7]`. Segments without brackets use `--min-norm-score`. The brackets are stripped from the name either way. See [Per-segment thresholds](#per-segment-thresholds). |
-| `--min-seq-len <INT>` | `100` | Reads shorter than this are dropped before alignment. Set this and `--max-seq-len` both to `0` to disable length filtering. |
-| `--max-seq-len <INT>` | `100000` | Reads longer than this are dropped before alignment. Must not be less than `--min-seq-len`. |
+| `--min-seq-len <INT>` | `0` | Reads shorter than this are dropped before alignment. `0` means no minimum, so by default no read is dropped for being short. |
+| `--max-seq-len <INT>` | `0` | Reads longer than this are dropped before alignment. `0` means no maximum. When both are set, this must not be less than `--min-seq-len`. |
 | `-t`, `--threads <INT>` | `1` | Reads are classified in parallel across this many threads. |
 | `-h`, `--help` | | Print help. |
 | `-V`, `--version` | | Print version. |
@@ -220,7 +220,9 @@ Only a *closed* bracket group at the end of the ID counts, so a name ending in `
 
 ### Reads (`--sequences`)
 
-One of FASTQ, gzipped FASTQ, or unaligned BAM (uBAM). The format is detected by inspecting the file contents, so the extension does not matter and there is no flag to set. Because BAM is itself gzip-framed, detection looks past the shared gzip header at the decompressed content to tell a gzipped FASTQ from a BAM.
+One of FASTA, FASTQ, either of those gzipped, or unaligned BAM (uBAM). The format is detected by inspecting the file contents — `>` for FASTA, `@` for FASTQ — so the extension does not matter and there is no flag to set. Because BAM is itself gzip-framed, detection looks past the shared gzip header at the decompressed content to tell a gzipped FASTA or FASTQ from a BAM.
+
+FASTA records may wrap their sequence across as many lines as they like; each record is rejoined into one read. Qualities are never used for classification, so a FASTA run and a FASTQ run over the same sequences produce identical results.
 
 Only *unaligned* BAM is accepted. An aligned BAM repeats a read once per alignment (secondary and supplementary records) and hard-clips supplementary sequence, which would silently inflate counts and truncate reads, so it is rejected with an error. Convert first:
 
@@ -314,7 +316,7 @@ Each read goes through up to four stages. Reads are streamed through in bounded 
 
 ### 1. Length filter
 
-Reads shorter than `--min-seq-len` or longer than `--max-seq-len` are dropped before any alignment work is done. Setting both to `0` disables the check.
+Reads shorter than `--min-seq-len` or longer than `--max-seq-len` are dropped before any alignment work is done. Each bound is `0` by default, meaning no bound on that side, so out of the box nothing is dropped for its length. The two are independent: `--min-seq-len 500` on its own drops short reads and leaves the upper end unbounded.
 
 ### 2. Anchoring and orientation (only with `-d`)
 
@@ -410,8 +412,8 @@ Options
   --per-segment-scores         off
   --start-end-segs             on
   --circular                   off
-  --min-seq-len                100
-  --max-seq-len                100000
+  --min-seq-len                0
+  --max-seq-len                0
   --threads                    1
   --detailed-output            off
   --classifications            classifications.txt

@@ -41,6 +41,29 @@ fn write_fastq(path: &Path, reads: &[(&str, &str)]) {
     }
 }
 
+/// Write a FASTA, wrapping sequences so multi-line records are exercised.
+fn write_fasta_reads(path: &Path, reads: &[(&str, &str)]) {
+    let mut f = File::create(path).unwrap();
+    for (name, seq) in reads {
+        writeln!(f, ">{name}").unwrap();
+        for line in seq.as_bytes().chunks(60) {
+            writeln!(f, "{}", String::from_utf8_lossy(line)).unwrap();
+        }
+    }
+}
+
+/// Write a gzipped FASTA.
+fn write_fasta_gz(path: &Path, reads: &[(&str, &str)]) {
+    let mut encoder = GzEncoder::new(File::create(path).unwrap(), Compression::default());
+    for (name, seq) in reads {
+        writeln!(encoder, ">{name}").unwrap();
+        for line in seq.as_bytes().chunks(60) {
+            writeln!(encoder, "{}", String::from_utf8_lossy(line)).unwrap();
+        }
+    }
+    encoder.finish().unwrap();
+}
+
 /// Write a gzipped FASTQ.
 fn write_fastq_gz(path: &Path, reads: &[(&str, &str)]) {
     let mut encoder = GzEncoder::new(File::create(path).unwrap(), Compression::default());
@@ -80,8 +103,9 @@ fn run_segment(refs: &Path, sequences: &Path, output: &Path, extra: &[&str]) {
     assert!(status.success(), "segment exited with {status}");
 }
 
-/// The CLI accepts FASTQ, gzipped FASTQ and unaligned BAM interchangeably with no
-/// format flag and no filename convention, and writes the identical tab-separated
+/// The CLI accepts FASTA, gzipped FASTA, FASTQ, gzipped FASTQ and unaligned BAM
+/// interchangeably with no format flag and no filename convention, and writes the
+/// identical tab-separated
 /// "<read name>\t<segments>" output from each. The two reads describe the same
 /// construct on opposite strands, so both must resolve to the same segment string.
 #[test]
@@ -98,14 +122,18 @@ fn cli_accepts_every_input_format_and_writes_matching_output() {
     let reverse = rc(&forward);
     let reads = [("fwd", forward.as_str()), ("rev", reverse.as_str())];
 
+    let fasta = dir.path().join("reads.fasta");
+    let fasta_gz = dir.path().join("reads.fasta.gz");
     let fastq = dir.path().join("reads.fastq");
     let gzipped = dir.path().join("reads.fastq.gz");
     let bam_file = dir.path().join("reads.bam");
+    write_fasta_reads(&fasta, &reads);
+    write_fasta_gz(&fasta_gz, &reads);
     write_fastq(&fastq, &reads);
     write_fastq_gz(&gzipped, &reads);
     write_bam(&bam_file, &reads);
 
-    for input in [&fastq, &gzipped, &bam_file] {
+    for input in [&fasta, &fasta_gz, &fastq, &gzipped, &bam_file] {
         let output = dir.path().join("out.txt");
         run_segment(&refs, input, &output, &["--start-end-segs"]);
         assert_eq!(
@@ -305,6 +333,53 @@ fn cli_rejects_an_unreadable_per_segment_score() {
         stderr.contains("'SEG1[1.5]'"),
         "the syntax is shown: {stderr}"
     );
+}
+
+/// The report names the format it detected, so a FASTA run says FASTA. The extension is
+/// deliberately wrong on each file here: detection reads the contents, so the report must
+/// too, and a mismatched extension must not be echoed back as if it were the format.
+#[test]
+fn cli_report_names_the_detected_format_not_the_extension() {
+    let dir = TempDir::new().unwrap();
+    let refs = dir.path().join("refs.fasta");
+    fs::write(&refs, format!(">A\n{SEG_A}\n")).unwrap();
+    let reads = [("r1", SEG_A)];
+
+    for (name, expected, write) in [
+        ("reads.bam", "FASTA", 0),
+        ("reads.fastq", "gzipped FASTA", 1),
+        ("reads.fasta", "FASTQ", 2),
+        ("reads.txt.gz", "gzipped FASTQ", 3),
+    ] {
+        let path = dir.path().join(name);
+        match write {
+            0 => write_fasta_reads(&path, &reads),
+            1 => write_fasta_gz(&path, &reads),
+            2 => write_fastq(&path, &reads),
+            _ => write_fastq_gz(&path, &reads),
+        }
+        let out = Command::new(env!("CARGO_BIN_EXE_segment"))
+            .args(["--segments", refs.to_str().unwrap()])
+            .args(["--sequences", path.to_str().unwrap()])
+            .args([
+                "--classifications",
+                dir.path().join("o.txt").to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{name}");
+        let report = String::from_utf8(out.stdout).unwrap();
+        // Matched on the trimmed row rather than the padded one: the label column is
+        // measured from the run's own longest row, so its width is not fixed.
+        assert!(
+            report.lines().any(|line| {
+                line.trim()
+                    .strip_prefix("sequences format")
+                    .is_some_and(|rest| rest.trim() == expected)
+            }),
+            "{name} should be reported as {expected}:\n{report}"
+        );
+    }
 }
 
 /// The report records what the run was given and how it was configured, so a captured
