@@ -41,6 +41,29 @@ fn write_fastq(path: &Path, reads: &[(&str, &str)]) {
     }
 }
 
+/// Write a FASTA, wrapping sequences so multi-line records are exercised.
+fn write_fasta_reads(path: &Path, reads: &[(&str, &str)]) {
+    let mut f = File::create(path).unwrap();
+    for (name, seq) in reads {
+        writeln!(f, ">{name}").unwrap();
+        for line in seq.as_bytes().chunks(60) {
+            writeln!(f, "{}", String::from_utf8_lossy(line)).unwrap();
+        }
+    }
+}
+
+/// Write a gzipped FASTA.
+fn write_fasta_gz(path: &Path, reads: &[(&str, &str)]) {
+    let mut encoder = GzEncoder::new(File::create(path).unwrap(), Compression::default());
+    for (name, seq) in reads {
+        writeln!(encoder, ">{name}").unwrap();
+        for line in seq.as_bytes().chunks(60) {
+            writeln!(encoder, "{}", String::from_utf8_lossy(line)).unwrap();
+        }
+    }
+    encoder.finish().unwrap();
+}
+
 /// Write a gzipped FASTQ.
 fn write_fastq_gz(path: &Path, reads: &[(&str, &str)]) {
     let mut encoder = GzEncoder::new(File::create(path).unwrap(), Compression::default());
@@ -80,8 +103,9 @@ fn run_segment(refs: &Path, sequences: &Path, output: &Path, extra: &[&str]) {
     assert!(status.success(), "segment exited with {status}");
 }
 
-/// The CLI accepts FASTQ, gzipped FASTQ and unaligned BAM interchangeably with no
-/// format flag and no filename convention, and writes the identical tab-separated
+/// The CLI accepts FASTA, gzipped FASTA, FASTQ, gzipped FASTQ and unaligned BAM
+/// interchangeably with no format flag and no filename convention, and writes the
+/// identical tab-separated
 /// "<read name>\t<segments>" output from each. The two reads describe the same
 /// construct on opposite strands, so both must resolve to the same segment string.
 #[test]
@@ -98,14 +122,18 @@ fn cli_accepts_every_input_format_and_writes_matching_output() {
     let reverse = rc(&forward);
     let reads = [("fwd", forward.as_str()), ("rev", reverse.as_str())];
 
+    let fasta = dir.path().join("reads.fasta");
+    let fasta_gz = dir.path().join("reads.fasta.gz");
     let fastq = dir.path().join("reads.fastq");
     let gzipped = dir.path().join("reads.fastq.gz");
     let bam_file = dir.path().join("reads.bam");
+    write_fasta_reads(&fasta, &reads);
+    write_fasta_gz(&fasta_gz, &reads);
     write_fastq(&fastq, &reads);
     write_fastq_gz(&gzipped, &reads);
     write_bam(&bam_file, &reads);
 
-    for input in [&fastq, &gzipped, &bam_file] {
+    for input in [&fasta, &fasta_gz, &fastq, &gzipped, &bam_file] {
         let output = dir.path().join("out.txt");
         run_segment(&refs, input, &output, &["--start-end-segs"]);
         assert_eq!(
@@ -131,13 +159,18 @@ fn cli_default_score_threshold_is_documented_value() {
     );
 }
 
-/// The summary is written to stderr, never to stdout or the results file, so it cannot
-/// contaminate a downstream pipeline reading either.
+/// The run report goes to stdout, warnings to stderr, and results to their own file, so
+/// each can be captured separately. Nothing competes for stdout: the results never go
+/// there, so `> run.txt` keeps the report and nothing else.
 #[test]
-fn cli_writes_summary_to_stderr_only() {
+fn cli_writes_the_run_report_to_stdout_and_warnings_to_stderr() {
     let dir = TempDir::new().unwrap();
     let refs = dir.path().join("refs.fasta");
-    fs::write(&refs, format!(">start\n{START}\n>end\n{END}\n>A\n{SEG_A}\n")).unwrap();
+    fs::write(
+        &refs,
+        format!(">start\n{START}\n>end\n{END}\n>A\n{SEG_A}\n"),
+    )
+    .unwrap();
 
     let sequences = dir.path().join("reads.fastq");
     write_fastq(
@@ -147,6 +180,13 @@ fn cli_writes_summary_to_stderr_only() {
             ("no_anchors", &format!("{JUNK}{SEG_A}{JUNK}")),
         ],
     );
+    // A record with no sequence, to produce a warning alongside the report.
+    let mut f = fs::OpenOptions::new()
+        .append(true)
+        .open(&sequences)
+        .unwrap();
+    writeln!(f, "@empty\n\n+\n").unwrap();
+    drop(f);
 
     let output = dir.path().join("out.txt");
     let result = Command::new(env!("CARGO_BIN_EXE_segment"))
@@ -159,16 +199,28 @@ fn cli_writes_summary_to_stderr_only() {
         .unwrap();
     assert!(result.status.success());
 
+    let stdout = String::from_utf8(result.stdout).unwrap();
     let stderr = String::from_utf8(result.stderr).unwrap();
-    assert!(stderr.contains("Summary"), "no summary on stderr:\n{stderr}");
-    assert!(stderr.contains("classified:"), "{stderr}");
+
+    assert!(stdout.contains("Summary"), "no report on stdout:\n{stdout}");
+    assert!(stdout.contains("classified:"), "{stdout}");
     assert!(
-        stderr.contains("neither segment found"),
-        "the unanchored read should be reported as a rejection:\n{stderr}"
+        stdout.contains("neither segment found"),
+        "the unanchored read should be reported as a rejection:\n{stdout}"
     );
 
-    assert!(String::from_utf8(result.stdout).unwrap().is_empty(), "stdout must stay clean");
-    // The results file holds only the classified read, with no summary text in it.
+    // Warnings stay on stderr: they are diagnostics about individual records, not part
+    // of the report, and mixing them into it would corrupt a captured report.
+    assert!(
+        stderr.contains("warning:") && stderr.contains("empty"),
+        "the unusable record should be warned about on stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("Summary"),
+        "the report should not be duplicated on stderr:\n{stderr}"
+    );
+
+    // The results file holds only the classified read, with no report text in it.
     assert_eq!(fs::read_to_string(&output).unwrap(), "good\tstart-A-end\n");
 }
 
@@ -281,6 +333,175 @@ fn cli_rejects_an_unreadable_per_segment_score() {
         stderr.contains("'SEG1[1.5]'"),
         "the syntax is shown: {stderr}"
     );
+}
+
+/// The report names the format it detected, so a FASTA run says FASTA. The extension is
+/// deliberately wrong on each file here: detection reads the contents, so the report must
+/// too, and a mismatched extension must not be echoed back as if it were the format.
+#[test]
+fn cli_report_names_the_detected_format_not_the_extension() {
+    let dir = TempDir::new().unwrap();
+    let refs = dir.path().join("refs.fasta");
+    fs::write(&refs, format!(">A\n{SEG_A}\n")).unwrap();
+    let reads = [("r1", SEG_A)];
+
+    for (name, expected, write) in [
+        ("reads.bam", "FASTA", 0),
+        ("reads.fastq", "gzipped FASTA", 1),
+        ("reads.fasta", "FASTQ", 2),
+        ("reads.txt.gz", "gzipped FASTQ", 3),
+    ] {
+        let path = dir.path().join(name);
+        match write {
+            0 => write_fasta_reads(&path, &reads),
+            1 => write_fasta_gz(&path, &reads),
+            2 => write_fastq(&path, &reads),
+            _ => write_fastq_gz(&path, &reads),
+        }
+        let out = Command::new(env!("CARGO_BIN_EXE_segment"))
+            .args(["--segments", refs.to_str().unwrap()])
+            .args(["--sequences", path.to_str().unwrap()])
+            .args([
+                "--classifications",
+                dir.path().join("o.txt").to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{name}");
+        let report = String::from_utf8(out.stdout).unwrap();
+        // Matched on the trimmed row rather than the padded one: the label column is
+        // measured from the run's own longest row, so its width is not fixed.
+        assert!(
+            report.lines().any(|line| {
+                line.trim()
+                    .strip_prefix("sequences format")
+                    .is_some_and(|rest| rest.trim() == expected)
+            }),
+            "{name} should be reported as {expected}:\n{report}"
+        );
+    }
+}
+
+/// The report records what the run was given and how it was configured, so a captured
+/// report says what produced the results beside it rather than only how they turned out.
+#[test]
+fn cli_report_records_the_inputs_and_the_options_it_ran_with() {
+    let dir = TempDir::new().unwrap();
+    let refs = dir.path().join("refs.fasta");
+    fs::write(
+        &refs,
+        format!(">start\n{START}\n>end\n{END}\n>A\n{SEG_A}\n"),
+    )
+    .unwrap();
+    let sequences = dir.path().join("reads.fastq");
+    write_fastq(
+        &sequences,
+        &[("read", &format!("{JUNK}{START}{SEG_A}{END}{JUNK}"))],
+    );
+
+    let output = dir.path().join("out.txt");
+    let result = Command::new(env!("CARGO_BIN_EXE_segment"))
+        .args(["--segments", refs.to_str().unwrap()])
+        .args(["--sequences", sequences.to_str().unwrap()])
+        .args(["--classifications", output.to_str().unwrap()])
+        .args(["--min-seq-len", "0", "--max-seq-len", "12345"])
+        .args(["--min-norm-score", "1.7", "--start-end-segs", "--circular"])
+        .output()
+        .unwrap();
+    assert!(result.status.success());
+    let report = String::from_utf8(result.stdout).unwrap();
+
+    // The files that went in, named and measured.
+    assert!(report.contains(refs.to_str().unwrap()), "{report}");
+    assert!(report.contains(sequences.to_str().unwrap()), "{report}");
+    assert!(report.contains("segments loaded"), "{report}");
+    assert!(report.contains("FASTQ"), "the detected format:\n{report}");
+
+    // The options at the values actually used, not their defaults.
+    for expected in [
+        "--min-norm-score",
+        "1.7",
+        "--max-seq-len",
+        "12345",
+        "--start-end-segs",
+        "--circular",
+    ] {
+        assert!(report.contains(expected), "missing {expected}:\n{report}");
+    }
+    // Flags that were not given are shown as off rather than omitted, so the report says
+    // what every option was, not only the ones that were typed.
+    assert!(report.contains("--detailed-output"), "{report}");
+    assert!(report.contains("off"), "{report}");
+    assert!(
+        report.contains("(not written)"),
+        "--counts was not given:\n{report}"
+    );
+
+    // When it ran and how fast.
+    assert!(
+        report.contains("started") && report.contains("finished"),
+        "{report}"
+    );
+    assert!(report.contains("UTC"), "timestamps are labelled:\n{report}");
+    assert!(report.contains("elapsed"), "{report}");
+    assert!(report.contains("reads per second"), "{report}");
+    assert!(report.contains("bases read"), "{report}");
+}
+
+/// --detailed-output adds two columns to the classifications file: where each segment
+/// sits in the extracted sequence, and that sequence itself. The per-read classification
+/// is unchanged by it, so the flag adds columns rather than altering the existing ones.
+#[test]
+fn cli_detailed_output_adds_positions_and_the_extracted_sequence() {
+    let dir = TempDir::new().unwrap();
+    let refs = dir.path().join("refs.fasta");
+    fs::write(
+        &refs,
+        format!(">start\n{START}\n>end\n{END}\n>A\n{SEG_A}\n>B\n{SEG_B}\n"),
+    )
+    .unwrap();
+
+    // The construct with junk either side, and the same thing sequenced backwards.
+    let construct = format!("{START}{SEG_A}{SEG_B}{END}");
+    let forward = format!("{JUNK}{construct}{JUNK}");
+    let sequences = dir.path().join("reads.fastq");
+    write_fastq(&sequences, &[("fwd", &forward), ("rev", &rc(&forward))]);
+
+    let plain = dir.path().join("plain.txt");
+    run_segment(&refs, &sequences, &plain, &["--start-end-segs"]);
+    assert_eq!(
+        fs::read_to_string(&plain).unwrap(),
+        "fwd\tstart-A-B-end\nrev\tstart-A-B-end\n",
+        "two columns without the flag"
+    );
+
+    let detailed = dir.path().join("detailed.txt");
+    run_segment(
+        &refs,
+        &sequences,
+        &detailed,
+        &["--start-end-segs", "--detailed-output"],
+    );
+    let report = fs::read_to_string(&detailed).unwrap();
+
+    // START is 20 bp, so A runs 21..40 and B 41..60 along the trimmed construct, with the
+    // anchors bounding it at either end. Both reads describe it identically, the reverse
+    // one having been reoriented first.
+    let expected = format!("start-A-B-end\tstart[1:20],A[21:40],B[41:60],end[61:80]\t{construct}");
+    assert_eq!(
+        report,
+        format!("fwd\t{expected}\nrev\t{expected}\n"),
+        "four columns with the flag"
+    );
+
+    // The first two columns are untouched by the flag.
+    let columns = |text: &str, n: usize| -> Vec<String> {
+        text.lines()
+            .map(|line| line.split('\t').take(n).collect::<Vec<_>>().join("\t"))
+            .collect()
+    };
+    let plain_report = fs::read_to_string(&plain).unwrap();
+    assert_eq!(columns(&report, 2), columns(&plain_report, 2));
 }
 
 /// --counts writes a CSV of every distinct classification and how many reads produced
@@ -549,7 +770,12 @@ fn cli_circular_flag_recovers_reads_that_wrap_the_origin() {
     assert_eq!(fs::read_to_string(&linear).unwrap(), "");
 
     let circular = dir.path().join("circular.txt");
-    run_segment(&refs, &sequences, &circular, &["--start-end-segs", "--circular"]);
+    run_segment(
+        &refs,
+        &sequences,
+        &circular,
+        &["--start-end-segs", "--circular"],
+    );
     assert_eq!(
         fs::read_to_string(&circular).unwrap(),
         "wrapped\tstart-A-end\n"

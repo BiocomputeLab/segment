@@ -32,7 +32,7 @@ To run `segment` it has the following usage:
 segment --segments REF_FASTA --sequences READS [OPTIONS] --classifications OUTPUT_FILE
 ```
 
-where `REF_FASTA` is a file containing the reference segments in FASTA format, `READS` is the sequencing data (FASTQ, gzipped FASTQ, or unaligned BAM), and `OUTPUT_FILE` is the filename to write the results to.
+where `REF_FASTA` is a file containing the reference segments in FASTA format, `READS` is the sequencing data (FASTA, FASTQ, either of those gzipped, or unaligned BAM), and `OUTPUT_FILE` is the filename to write the results to.
 
 By default every read is classified exactly as it arrives. Passing `-d/--start-end-segs` instead uses the segments named `start` and `end` to anchor each read: reads are oriented, trimmed to the region between the two anchors, and dropped if either anchor is missing. This is usually what you want when the reads contain adapters or other flanking sequence.
 
@@ -41,7 +41,7 @@ By default every read is classified exactly as it arrives. Passing `-d/--start-e
 | Argument | Description |
 |---|---|
 | `--segments <FILE>` | FASTA file of segment sequences to search for, one record per segment. Record IDs become the names used in the output. Names must be unique and no record may be empty. |
-| `--sequences <FILE>` | Reads to classify: FASTQ, gzipped FASTQ, or unaligned BAM. The format is detected from the file contents, so the extension is irrelevant. |
+| `--sequences <FILE>` | Reads to classify: FASTA, FASTQ, either of those gzipped, or unaligned BAM. The format is detected from the file contents, so the extension is irrelevant. |
 
 ### Optional arguments
 
@@ -49,17 +49,18 @@ By default every read is classified exactly as it arrives. Passing `-d/--start-e
 |---|---|---|
 | `-o`, `--classifications <FILE>` | `classifications.txt` | Where to write the tab-separated per-read results. Overwritten if it exists. |
 | `--counts <FILE>` | off | Also write a CSV counting how many reads produced each distinct classification. See [Classification counts](#classification-counts). |
+| `--detailed-output` | off | Add two columns to the classifications file: where each segment sits in the extracted sequence, and that sequence itself. See [Detailed output](#detailed-output). |
 | `-d`, `--start-end-segs` | off | Use the segments named `start` and `end` to anchor, trim and orient each read; they then bound the segment string instead of being reported within it. Reads missing either anchor are dropped. Errors if the segments file has no `start` or `end` record. |
 | `-c`, `--circular` | off | Treat reads as coming from a circular template, so a read that crosses the origin (`end` before `start`) is rotated back into order rather than rejected. Only meaningful together with `-d`. |
 | `-s`, `--min-norm-score <FLOAT>` | `1.5` | Minimum normalised alignment score for a segment to count as found, from `0.0` to `2.0`, where `2.0` is a perfect match. See [Choosing a score threshold](#choosing-a-score-threshold). |
 | `--per-segment-scores` | off | Use each segment's own threshold from square brackets after its name, as in `>SEG1[1.7]`. Segments without brackets use `--min-norm-score`. The brackets are stripped from the name either way. See [Per-segment thresholds](#per-segment-thresholds). |
-| `--min-seq-len <INT>` | `100` | Reads shorter than this are dropped before alignment. Set this and `--max-seq-len` both to `0` to disable length filtering. |
-| `--max-seq-len <INT>` | `100000` | Reads longer than this are dropped before alignment. Must not be less than `--min-seq-len`. |
+| `--min-seq-len <INT>` | `0` | Reads shorter than this are dropped before alignment. `0` means no minimum, so by default no read is dropped for being short. |
+| `--max-seq-len <INT>` | `0` | Reads longer than this are dropped before alignment. `0` means no maximum. When both are set, this must not be less than `--min-seq-len`. |
 | `-t`, `--threads <INT>` | `1` | Reads are classified in parallel across this many threads. |
 | `-h`, `--help` | | Print help. |
 | `-V`, `--version` | | Print version. |
 
-Peak memory does not grow with the size of the input. Reads are streamed through in bounded chunks, and all alignment runs in space linear in the read length and independent of segment length, so long segments and long anchors cost no more than short ones. The practical ceiling is a single very long read, not the file.
+Peak memory does not grow with the size of the input. Reads are streamed through in bounded chunks, and all alignment runs in space linear in the read length and independent of segment length, so long segments and long anchors cost no more than short ones. The practical ceiling is a single very long read, not the file. `--detailed-output` roughly doubles what a chunk holds, since it carries each read's extracted sequence until the chunk is written, but the chunk is still bounded.
 
 ## Example
 
@@ -86,18 +87,18 @@ c689dd31-4e98-4154-ab05-a8b0abed9436	start-end
 ...
 ```
 
-and a summary of the run is printed to stderr:
+and a report of the run is printed to stdout. Its read accounting looks like this — see [Run report](#run-report) for the rest of it:
 
 ```
 Summary
-  reads read:            100
-  classified:             62  (62.0%)
-  not classified:         38  (38.0%)
-    read too short                           10
-    read too long                             8
-    'start' segment not found                 2
-    'end' segment not found                  17
-    neither segment found                     1
+  reads read:                  100
+  classified:                   62  (62.0%)
+  not classified:               38  (38.0%)
+    read too short              10
+    read too long                8
+    'start' segment not found    2
+    'end' segment not found     17
+    neither segment found        1
 ```
 
 This should run very quickly and take less than a minute to run on a standard desktop machine.
@@ -219,7 +220,9 @@ Only a *closed* bracket group at the end of the ID counts, so a name ending in `
 
 ### Reads (`--sequences`)
 
-One of FASTQ, gzipped FASTQ, or unaligned BAM (uBAM). The format is detected by inspecting the file contents, so the extension does not matter and there is no flag to set. Because BAM is itself gzip-framed, detection looks past the shared gzip header at the decompressed content to tell a gzipped FASTQ from a BAM.
+One of FASTA, FASTQ, either of those gzipped, or unaligned BAM (uBAM). The format is detected by inspecting the file contents — `>` for FASTA, `@` for FASTQ — so the extension does not matter and there is no flag to set. Because BAM is itself gzip-framed, detection looks past the shared gzip header at the decompressed content to tell a gzipped FASTA or FASTQ from a BAM.
+
+FASTA records may wrap their sequence across as many lines as they like; each record is rejoined into one read. Qualities are never used for classification, so a FASTA run and a FASTQ run over the same sequences produce identical results.
 
 Only *unaligned* BAM is accepted. An aligned BAM repeats a read once per alignment (secondary and supplementary records) and hard-clips supplementary sequence, which would silently inflate counts and truncate reads, so it is rejected with an error. Convert first:
 
@@ -237,6 +240,8 @@ A tab-separated file with one line per accepted read and no header:
 <read name><TAB><segment string>
 ```
 
+[`--detailed-output`](#detailed-output) adds two more columns to each line.
+
 The segment string lists the segments found, in the order they occur along the read, joined by `-`:
 
 | String | Meaning |
@@ -253,11 +258,33 @@ start-attP_Bxb1-attB_Tp901*-end
 start-end                          ← anchors found, nothing in between
 ```
 
-Note that reads which are filtered out do not appear in the output at all. A read is dropped if it falls outside the length bounds, or — with `-d` — if either anchor is missing, too degraded to score above the threshold, or in an inconsistent order. The [run summary](#run-summary) accounts for every one of them.
+Note that reads which are filtered out do not appear in the output at all. A read is dropped if it falls outside the length bounds, or — with `-d` — if either anchor is missing, too degraded to score above the threshold, or in an inconsistent order. The [run report](#run-report) accounts for every one of them.
 
 Results are deterministic: the same input, segments and settings always produce byte-identical output, including the order of lines, regardless of `--threads`.
 
 While running, a progress bar on stderr shows how much of the file has been consumed, with a running read count and an ETA. It is measured in bytes of the input file, so it works the same for gzipped and BAM input, where the number of reads is not known until the file has been read.
+
+### Detailed output
+
+`--detailed-output` adds two columns to the same file:
+
+```
+<read name><TAB><segment string><TAB><located segments><TAB><extracted sequence>
+```
+
+```
+ad6f445e   start-attP_Bxb1*-end   start[1:40],attP_Bxb1*[929:978],end[979:1018]   CTCGGATACCCTTA…
+```
+
+**Located segments** repeats the segment string with the span each hit covers, and does so name for name: every name in the segment string has an entry here, in the same order. Entries are separated by commas, and the two positions within an entry by a colon, so the column can be split on `,` without the two separators being confused for one another.
+
+Positions are **1-based and inclusive of both ends**, counted along the extracted sequence in the next column. So `attP_Bxb1*[929:978]` is 50 bases and `sequence[929..=978]` cuts it out. Reverse-strand hits keep the same trailing `*` they have in the segment string. A read with no segments above the threshold gets an empty column rather than a missing one, so every row has the same number of columns.
+
+With `-d/--start-end-segs` the anchors are reported here too. They are always the two ends of the extracted sequence — `start` opens it and `end` closes it — but the *spans* are worth having: they are what the anchors actually aligned across, so an anchor that matched short or long shows up here rather than having to be inferred. In the example above `start[1:40]` covers all 40 bases of the anchor, while a read whose anchor aligned with a deletion would report 39.
+
+**Extracted sequence** is the read exactly as it was classified — the whole read when no anchors were given, and the trimmed, reoriented span from `start` to `end` (anchors included) when they were. This is what makes the positions well defined: with `-d` a read sequenced backwards is reverse complemented before classification, so both strands of the same molecule produce identical positions, counted along the sequence in the column rather than along the read as it arrived.
+
+Because the extracted sequence is carried alongside each read until its chunk is written, this roughly doubles what a chunk holds in memory. Chunks are bounded, so the ceiling does not grow with the size of the input.
 
 ### Classification counts
 
@@ -279,7 +306,7 @@ start-attB_Int5-attB_BxB1*-attP_Int5*-attP_Tp901-attP_Bxb1*-end,1
 
 Rows are ordered by count, most frequent first, with equal counts ordered alphabetically so that two runs over the same reads produce byte-identical files and a diff between two conditions stays readable.
 
-The counts cover the reads that were *classified*, and so add up to the number of lines in the results file rather than to the number of reads in the input. Reads dropped for their length or for a missing anchor never reach a classification and are accounted for in the [run summary](#run-summary) on stderr instead. A read that was classified but carried no recognisable segments is a real result and gets a row with an empty first field.
+The counts cover the reads that were *classified*, and so add up to the number of lines in the results file rather than to the number of reads in the input. Reads dropped for their length or for a missing anchor never reach a classification and are accounted for in the [run report](#run-report) instead. A read that was classified but carried no recognisable segments is a real result and gets a row with an empty first field.
 
 A run that classified nothing still writes the header row, so the file is always valid CSV. Fields are quoted where a segment name contains a comma, a quote or a newline.
 
@@ -289,7 +316,7 @@ Each read goes through up to four stages. Reads are streamed through in bounded 
 
 ### 1. Length filter
 
-Reads shorter than `--min-seq-len` or longer than `--max-seq-len` are dropped before any alignment work is done. Setting both to `0` disables the check.
+Reads shorter than `--min-seq-len` or longer than `--max-seq-len` are dropped before any alignment work is done. Each bound is `0` by default, meaning no bound on that side, so out of the box nothing is dropped for its length. The two are independent: `--min-seq-len 500` on its own drops short reads and leaves the upper end unbounded.
 
 ### 2. Anchoring and orientation (only with `-d`)
 
@@ -363,25 +390,58 @@ it almost anywhere. Use a more specific sequence, or raise the score it is found
 
 This is a warning rather than an error, since a mostly degenerate probe is a legitimate thing to search for. Each segment is judged against its own threshold, so giving just that segment a stricter one with [`--per-segment-scores`](#per-segment-thresholds) both silences the warning and fixes what it is warning about, without making every other segment stricter.
 
-## Run summary
+## Run report
 
-At the end of every run a summary is written to stderr, accounting for every read:
+At the end of every run a report is written to **stdout**, describing what went in, how the run was configured, how the reads were accounted for, and how fast it went:
 
 ```
+Run
+  started                      2026-09-01 18:24:13 UTC
+  finished                     2026-09-01 18:24:13 UTC
+  elapsed                      0.31 s
+
+Input
+  segments file                data/refs.fasta
+  segments loaded                8
+  sequences file               data/reads.fastq
+  sequences format             FASTQ
+  sequences size               270.4 KiB
+
+Options
+  --min-norm-score             1.5
+  --per-segment-scores         off
+  --start-end-segs             on
+  --circular                   off
+  --min-seq-len                0
+  --max-seq-len                0
+  --threads                    1
+  --detailed-output            off
+  --classifications            classifications.txt
+  --counts                     (not written)
+
 Summary
-  reads read:                               10
-  classified:                                4  (40.0%)
-  not classified:                            6  (60.0%)
-    read too short                           1
-    'start' segment not found                1
-    'end' segment not found                  1
-    neither segment found                    1
-    'start'/'end' on opposite strands        1
-    'start'/'end' out of order               1
-  records skipped while reading the input:   1
+  reads read:                  100
+  classified:                   70  (70.0%)
+  not classified:               30  (30.0%)
+    'start' segment not found    2
+    'end' segment not found     24
+    neither segment found        4
+
+Throughput
+  bases read                   126.0 kbase
+  reads per second             321
+  bases per second             404.0 kbase
 ```
 
-Classified and not-classified always add back up to the number of reads, and each rejected read is counted under exactly one reason. Categories that did not occur are left out, so a run with no anchoring shows only the length rejections.
+**Run** timestamps the run. Times are UTC so they sort and compare without ambiguity about the machine's timezone. `elapsed` is measured on a monotonic clock, so an adjustment to the system clock mid-run cannot distort it.
+
+**Input** names both files, how many segments were loaded from the first, and the detected format and size of the second — so a report says which files produced it, not just what came out.
+
+**Options** lists *every* option at the value it actually ran with, including the ones left at their defaults. Together with the input section this makes the report a record of what produced the results beside it, which is what makes a run reproducible from its own output.
+
+**Summary** accounts for every read. Classified and not-classified always add back up to the number of reads, and each rejected read is counted under exactly one reason. Categories that did not occur are left out, so a run with no anchoring shows only the length rejections.
+
+**Throughput** is the rate over the whole run, loading included. A run too short for the clock to measure quotes no rate rather than an infinity.
 
 Every count shares one column whatever its nesting depth, and the columns are measured from the rows actually being printed, so a run of a hundred reads and a run of ten million both come out square:
 
@@ -402,7 +462,14 @@ Summary
 | `'start'/'end' out of order` | Both anchors found on the same strand, but `end` precedes `start`. Add `--circular` if the template is circular and these reads cross the origin. |
 | `records skipped while reading the input` | Malformed, unnamed or sequence-less records skipped during loading. Each is also warned about individually. |
 
-Anchor-related reasons only arise with `-d/--start-end-segs`. Because the summary goes to stderr it never mixes with the results file, and `2>run.log` captures it together with any warnings.
+Anchor-related reasons only arise with `-d/--start-end-segs`.
+
+The report goes to stdout while warnings go to stderr, and the results go to their own file, so the three can be captured separately. Nothing else is written to stdout, so `> run.txt` keeps the report and nothing but the report:
+
+```sh
+segment --segments refs.fasta --sequences reads.fastq -d \
+        --classifications results.txt > run.txt 2> warnings.log
+```
 
 ## Errors and warnings
 
@@ -415,7 +482,7 @@ error: Segment 'attB_Tp901' is defined more than once in 'parts.fasta'. Segment 
 must be unique, otherwise it is ambiguous which sequence should be searched for.
 ```
 
-**Warnings** go to stderr and processing continues. On startup, a segment [degenerate enough to match random sequence](#thresholds-and-ambiguous-bases) is named, as is one that [asks for a threshold](#per-segment-thresholds) without `--per-segment-scores` to apply it. An individual malformed or unusable record is skipped, named where possible, and a summary is printed once the file is read:
+**Warnings** go to stderr and processing continues. On startup, a segment [degenerate enough to match random sequence](#thresholds-and-ambiguous-bases) is named, as is one that [asks for a threshold](#per-segment-thresholds) without `--per-segment-scores` to apply it. An individual malformed or unusable record is skipped, named where possible, and a count of them is printed once the file is read:
 
 ```
 warning: skipping malformed read 'ad6f445e' in 'reads.fastq': Incomplete record. ...

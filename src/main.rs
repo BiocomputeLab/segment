@@ -2,6 +2,7 @@
 // Author: Thomas E. Gorochowski <tom@chofski.co.uk>
 
 use bio::alphabets::dna;
+use bio::io::fasta::FastaRead;
 use bio::io::fastq::FastqRead;
 use bio::io::{fasta, fastq};
 use clap::Parser;
@@ -13,6 +14,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::path::Path;
+use std::time::{Duration, Instant, SystemTime};
 
 #[cfg(test)]
 mod tests;
@@ -359,6 +361,17 @@ fn chance_match_fraction(seq: &[u8]) -> f32 {
 struct SegmentedRead {
     name: String,
     segments: String,
+    /// Filled only with `--detailed-output`, which is what decides whether the extra
+    /// columns are written. The extracted sequence roughly doubles what a chunk holds
+    /// while it is being written, so it is not carried when nothing will print it.
+    detail: Option<ReadDetail>,
+}
+
+/// The extra columns `--detailed-output` adds: where each segment sits in the extracted
+/// sequence, and that sequence itself.
+struct ReadDetail {
+    located: String,
+    sequence: String,
 }
 
 /// A read name/sequence pair, independent of the input file format it came from.
@@ -374,6 +387,88 @@ struct LoadedReads {
     reads: Vec<RawRead>,
     #[allow(dead_code)] // mirrors what `run` reports; kept so the shape matches
     skipped: usize,
+}
+
+/// Format a system time as `YYYY-MM-DD HH:MM:SS UTC`.
+///
+/// Done by hand rather than by pulling in a date library: the report only needs a
+/// timestamp a person can read, and UTC sidesteps needing the timezone database that the
+/// standard library cannot reach anyway.
+fn format_utc(time: SystemTime) -> String {
+    let Ok(since_epoch) = time.duration_since(SystemTime::UNIX_EPOCH) else {
+        // A clock set before 1970 is not worth handling, but is not worth crashing over.
+        return "unknown".to_string();
+    };
+    let secs = since_epoch.as_secs() as i64;
+    let (days, rest) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    let (year, month, day) = civil_from_days(days);
+    let (hour, minute, second) = (rest / 3600, (rest % 3600) / 60, rest % 60);
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} UTC")
+}
+
+/// Days since 1970-01-01 as a calendar date, by Howard Hinnant's `civil_from_days`.
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    // Shift the epoch to 0000-03-01 so that leap days fall at the end of the cycle.
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    (year, month, day)
+}
+
+/// A byte count at human scale, e.g. `1.4 MiB`.
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit + 1 < UNITS.len() {
+        size /= 1024.0;
+        unit += 1;
+    }
+    // Whole bytes are always whole; anything scaled reads better to one decimal place.
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{size:.1} {}", UNITS[unit])
+    }
+}
+
+/// A count of bases at human scale, e.g. `7.6 Mbase`. Decimal rather than binary, which
+/// is how sequence lengths are always quoted.
+fn human_bases(bases: f64) -> String {
+    const UNITS: [&str; 4] = ["base", "kbase", "Mbase", "Gbase"];
+    let mut size = bases;
+    let mut unit = 0;
+    while size >= 1000.0 && unit + 1 < UNITS.len() {
+        size /= 1000.0;
+        unit += 1;
+    }
+    format!("{size:.1} {}", UNITS[unit])
+}
+
+/// A duration at human scale: seconds while that stays readable, then minutes and hours.
+fn human_duration(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs_f64();
+    if secs < 60.0 {
+        return format!("{secs:.2} s");
+    }
+    let whole = elapsed.as_secs();
+    let (hours, minutes, seconds) = (whole / 3600, (whole % 3600) / 60, whole % 60);
+    if hours > 0 {
+        format!("{hours} h {minutes:02} m {seconds:02} s")
+    } else {
+        format!("{minutes} m {seconds:02} s")
+    }
 }
 
 /// Why a read produced no classification. Every read that is not classified falls into
@@ -454,35 +549,28 @@ impl RunSummary {
         self.classified + self.not_classified()
     }
 
-    /// Render the end-of-run summary. Categories that cannot arise for the given
+    /// The read accounting as report rows. Categories that cannot arise for the given
     /// settings - the anchor ones without --start-end-segs, for instance - stay at zero
     /// and are left out, so the report only shows what actually happened.
-    ///
-    /// Every count lands in one column whatever its nesting depth, and the columns are
-    /// measured from the rows actually being printed rather than fixed, so a run of a
-    /// hundred reads and a run of ten million both come out square. Percentages are
-    /// right-aligned too, which lines up the decimal point.
-    fn render(&self) -> String {
+    fn rows(&self) -> Vec<Row> {
         // Blank unless there are reads to be a share of, which also drops the column.
-        let pct = |n: usize| -> String {
+        let share = |n: usize| -> String {
             if self.reads() == 0 {
                 String::new()
             } else {
                 format!("({:.1}%)", 100.0 * n as f64 / self.reads() as f64)
             }
         };
-
-        // Indent, label, count, and the share of all reads where one is meaningful. The
-        // breakdown rows are shares of the reads that were not classified rather than of
-        // every read, so quoting them against the same total would mislead.
-        let mut rows: Vec<(usize, &str, usize, String)> = vec![
-            (2, "reads read:", self.reads(), String::new()),
-            (2, "classified:", self.classified, pct(self.classified)),
-            (
+        // The breakdown rows are shares of the reads that were not classified rather
+        // than of every read, so quoting them against the same total would mislead.
+        let mut rows = vec![
+            Row::count(2, "reads read:", self.reads(), String::new()),
+            Row::count(2, "classified:", self.classified, share(self.classified)),
+            Row::count(
                 2,
                 "not classified:",
                 self.not_classified(),
-                pct(self.not_classified()),
+                share(self.not_classified()),
             ),
         ];
         for (label, count) in [
@@ -498,34 +586,29 @@ impl RunSummary {
             ("'start'/'end' out of order", self.anchors_out_of_order),
         ] {
             if count > 0 {
-                rows.push((4, label, count, String::new()));
+                rows.push(Row::count(4, label, count, String::new()));
             }
         }
         // Records that never became reads at all, so outside the accounting above.
         if self.unreadable > 0 {
-            rows.push((
+            rows.push(Row::count(
                 2,
                 "records skipped while reading the input:",
                 self.unreadable,
                 String::new(),
             ));
         }
+        rows
+    }
 
-        let width = |lengths: &mut dyn Iterator<Item = usize>| lengths.max().unwrap_or(0);
-        let label_width = width(&mut rows.iter().map(|(indent, label, ..)| indent + label.len()));
-        let count_width = width(&mut rows.iter().map(|(_, _, count, _)| count.to_string().len()));
-        let pct_width = width(&mut rows.iter().map(|(.., pct)| pct.len()));
-
-        let mut out = String::from("\nSummary\n");
-        for (indent, label, count, pct) in &rows {
-            let label = format!("{}{label}", " ".repeat(*indent));
-            out.push_str(&format!("{label:<label_width$}  {count:>count_width$}"));
-            if !pct.is_empty() {
-                out.push_str(&format!("  {pct:>pct_width$}"));
-            }
-            out.push('\n');
-        }
-        out
+    /// The read accounting on its own, laid out as [`render_rows`] describes. Production
+    /// renders it as one section of [`RunReport`]; this is how the tests get at the block
+    /// without building a whole report around it.
+    #[cfg(test)]
+    fn render(&self) -> String {
+        let mut rows = vec![Row::heading("Summary")];
+        rows.extend(self.rows());
+        render_rows(&rows)
     }
 }
 
@@ -581,17 +664,197 @@ fn csv_field(value: &str) -> String {
     }
 }
 
+/// One line of the end-of-run report: a heading, a labelled count to be right-aligned
+/// into the numbers column, or a labelled value that simply follows its label.
+enum Row {
+    Heading(String),
+    Count {
+        indent: usize,
+        label: String,
+        count: usize,
+        share: String,
+    },
+    Value {
+        indent: usize,
+        label: String,
+        value: String,
+    },
+}
+
+impl Row {
+    fn heading(title: &str) -> Row {
+        Row::Heading(title.to_string())
+    }
+
+    fn count(indent: usize, label: &str, count: usize, share: String) -> Row {
+        Row::Count {
+            indent,
+            label: label.to_string(),
+            count,
+            share,
+        }
+    }
+
+    fn value(label: &str, value: impl Into<String>) -> Row {
+        Row::Value {
+            indent: 2,
+            label: label.to_string(),
+            value: value.into(),
+        }
+    }
+
+    /// How wide this row's label is, indent included, or none for a heading.
+    fn label_width(&self) -> Option<usize> {
+        match self {
+            Row::Heading(_) => None,
+            Row::Count { indent, label, .. } | Row::Value { indent, label, .. } => {
+                Some(indent + label.len())
+            }
+        }
+    }
+}
+
+/// Lay out report rows so that every count lands in one column whatever its nesting
+/// depth, and every value starts in one column too.
+///
+/// The columns are measured from the rows actually being printed rather than fixed, so a
+/// run of a hundred reads and a run of ten million both come out square. Shares are
+/// right-aligned as well, which lines up the decimal point.
+fn render_rows(rows: &[Row]) -> String {
+    let width = |lengths: &mut dyn Iterator<Item = usize>| lengths.max().unwrap_or(0);
+    let label_width = width(&mut rows.iter().filter_map(Row::label_width));
+    let count_width = width(&mut rows.iter().filter_map(|row| match row {
+        Row::Count { count, .. } => Some(count.to_string().len()),
+        _ => None,
+    }));
+    let share_width = width(&mut rows.iter().filter_map(|row| match row {
+        Row::Count { share, .. } => Some(share.len()),
+        _ => None,
+    }));
+
+    let mut out = String::new();
+    for row in rows {
+        match row {
+            Row::Heading(title) => out.push_str(&format!("\n{title}\n")),
+            Row::Count {
+                indent,
+                label,
+                count,
+                share,
+            } => {
+                let label = format!("{}{label}", " ".repeat(*indent));
+                out.push_str(&format!("{label:<label_width$}  {count:>count_width$}"));
+                if !share.is_empty() {
+                    out.push_str(&format!("  {share:>share_width$}"));
+                }
+                out.push('\n');
+            }
+            Row::Value {
+                indent,
+                label,
+                value,
+            } => {
+                let label = format!("{}{label}", " ".repeat(*indent));
+                out.push_str(&format!("{label:<label_width$}  {value}\n"));
+            }
+        }
+    }
+    out
+}
+
+/// Everything the end-of-run report says about the run itself: what went in, how it was
+/// configured, when it ran and how fast. The read accounting comes from [`RunSummary`].
+///
+/// Written to stdout so it can be captured with `> run.txt` or piped into something that
+/// keeps it, separately from the warnings on stderr. The results go to their own file, so
+/// nothing is competing for stdout.
+struct RunReport {
+    started: SystemTime,
+    finished: SystemTime,
+    elapsed: Duration,
+    segments_file: String,
+    segments_loaded: usize,
+    sequences_file: String,
+    sequences_format: &'static str,
+    sequences_bytes: u64,
+    reads: usize,
+    bases: u64,
+    options: Vec<(String, String)>,
+}
+
+impl RunReport {
+    /// The whole report: the run, its inputs and options, the read accounting, and how
+    /// fast it went. Laid out by [`render_rows`], so every column lines up across the
+    /// sections rather than each being square only within itself.
+    fn render(&self, summary: &RunSummary) -> String {
+        let mut rows = vec![
+            Row::heading("Run"),
+            Row::value("started", format_utc(self.started)),
+            Row::value("finished", format_utc(self.finished)),
+            Row::value("elapsed", human_duration(self.elapsed)),
+            Row::heading("Input"),
+            Row::value("segments file", self.segments_file.clone()),
+            Row::count(2, "segments loaded", self.segments_loaded, String::new()),
+            Row::value("sequences file", self.sequences_file.clone()),
+            Row::value("sequences format", self.sequences_format),
+            Row::value("sequences size", human_bytes(self.sequences_bytes)),
+            Row::heading("Options"),
+        ];
+        rows.extend(
+            self.options
+                .iter()
+                .map(|(name, value)| Row::value(name, value.clone())),
+        );
+        rows.push(Row::heading("Summary"));
+        rows.extend(summary.rows());
+        rows.push(Row::heading("Throughput"));
+        rows.push(Row::value("bases read", human_bases(self.bases as f64)));
+        // A run so short that the clock cannot separate its ends has no meaningful rate
+        // to quote, and dividing by it would print an infinity.
+        let seconds = self.elapsed.as_secs_f64();
+        if seconds > 0.0 {
+            rows.push(Row::value(
+                "reads per second",
+                format!("{:.0}", self.reads as f64 / seconds),
+            ));
+            rows.push(Row::value(
+                "bases per second",
+                human_bases(self.bases as f64 / seconds),
+            ));
+        }
+        render_rows(&rows)
+    }
+}
+
 /// The auto-detected format of a sequences file.
 enum InputFormat {
+    Fasta,
+    FastaGz,
     Fastq,
     FastqGz,
     Bam,
 }
 
-/// Inspect a file to determine whether it's FASTQ (starts with '@'), gzipped FASTQ, or BAM.
+impl InputFormat {
+    /// What to call this format in the run report.
+    fn name(&self) -> &'static str {
+        match self {
+            InputFormat::Fasta => "FASTA",
+            InputFormat::FastaGz => "gzipped FASTA",
+            InputFormat::Fastq => "FASTQ",
+            InputFormat::FastqGz => "gzipped FASTQ",
+            InputFormat::Bam => "unaligned BAM",
+        }
+    }
+}
+
+/// Inspect a file to determine whether it's FASTA (starts with '>'), FASTQ (starts with
+/// '@'), either of those gzipped, or BAM.
+///
 /// BAM is always BGZF-compressed (i.e. gzip-wrapped), so a gzip magic number alone doesn't
-/// distinguish it from a gzipped FASTQ file - the decompressed content is peeked to tell
-/// them apart (BAM starts with the "BAM\1" magic bytes, FASTQ starts with '@').
+/// distinguish it from a gzipped FASTQ or FASTA file - the decompressed content is peeked
+/// to tell them apart (BAM starts with the "BAM\1" magic bytes, FASTQ with '@', FASTA
+/// with '>').
 fn detect_format(filename: &Path) -> Result<InputFormat> {
     let open = |what: &str| {
         File::open(filename).map_err(|e| {
@@ -623,19 +886,23 @@ fn detect_format(filename: &Path) -> Result<InputFormat> {
             Ok(InputFormat::Bam)
         } else if peek_n >= 1 && peek[0] == b'@' {
             Ok(InputFormat::FastqGz)
+        } else if peek_n >= 1 && peek[0] == b'>' {
+            Ok(InputFormat::FastaGz)
         } else {
             Err(format!(
                 "Could not determine the format of '{}'. It is gzip-compressed but its contents are \
-                 neither FASTQ (records start with '@') nor BAM.",
+                 none of FASTQ (records start with '@'), FASTA (records start with '>') or BAM.",
                 filename.display()
             ))
         }
     } else if n >= 1 && magic[0] == b'@' {
         Ok(InputFormat::Fastq)
+    } else if n >= 1 && magic[0] == b'>' {
+        Ok(InputFormat::Fasta)
     } else {
         Err(format!(
             "Could not determine the format of '{}'. Expected FASTQ (records start with '@'), \
-             gzipped FASTQ, or an unaligned BAM.",
+             FASTA (records start with '>'), either of those gzipped, or an unaligned BAM.",
             filename.display()
         ))
     }
@@ -660,6 +927,7 @@ impl<R: Read> Read for CountingReader<R> {
 
 /// The parser behind a `ReadStream`, one per accepted input format.
 enum Source {
+    Fasta(fasta::Reader<std::io::BufReader<Box<dyn Read>>>),
     Fastq(fastq::Reader<std::io::BufReader<Box<dyn Read>>>),
     Bam(Box<bam::io::Reader<bgzf::io::Reader<CountingReader<File>>>>),
 }
@@ -671,9 +939,13 @@ enum Source {
 /// reported once the whole file has been read.
 struct ReadStream {
     source: Source,
+    /// What `detect_format` decided when the file was opened, kept so the run report can
+    /// name it without re-reading the file - which by then might not even be there.
+    format: &'static str,
     filename: std::path::PathBuf,
     bytes_read: std::sync::Arc<std::sync::atomic::AtomicU64>,
     record: fastq::Record,
+    fasta_record: fasta::Record,
     bam_record: bam::Record,
     skipped: usize,
     index: usize,
@@ -697,7 +969,17 @@ impl ReadStream {
                     bytes: bytes.clone(),
                 })
             };
-        let source = match detect_format(filename)? {
+        let format = detect_format(filename)?;
+        let source = match format {
+            InputFormat::Fasta => {
+                let raw: Box<dyn Read> = Box::new(counted(&bytes_read)?);
+                Source::Fasta(fasta::Reader::new(raw))
+            }
+            InputFormat::FastaGz => {
+                let raw: Box<dyn Read> =
+                    Box::new(flate2::read::MultiGzDecoder::new(counted(&bytes_read)?));
+                Source::Fasta(fasta::Reader::new(raw))
+            }
             InputFormat::Fastq => {
                 let raw: Box<dyn Read> = Box::new(counted(&bytes_read)?);
                 Source::Fastq(fastq::Reader::new(raw))
@@ -720,9 +1002,11 @@ impl ReadStream {
         };
         Ok(ReadStream {
             source,
+            format: format.name(),
             filename: filename.to_path_buf(),
             bytes_read,
             record: fastq::Record::new(),
+            fasta_record: fasta::Record::new(),
             bam_record: bam::Record::default(),
             skipped: 0,
             index: 0,
@@ -755,6 +1039,59 @@ impl ReadStream {
     /// The next usable read, skipping over any that cannot be used.
     fn next_read(&mut self) -> Result<Option<RawRead>> {
         match &mut self.source {
+            // FASTA carries no qualities, which the classifier never looks at anyway, so
+            // apart from the record type this mirrors the FASTQ branch below exactly.
+            Source::Fasta(reader) => loop {
+                match reader.read(&mut self.fasta_record) {
+                    Ok(()) => {
+                        if self.fasta_record.is_empty() {
+                            return Ok(None);
+                        }
+                        self.index += 1;
+                        self.consecutive_errors = 0;
+                        if self.fasta_record.seq().is_empty() {
+                            warn(format!(
+                                "skipping read '{}' in '{}': it has no sequence",
+                                self.fasta_record.id(),
+                                self.filename.display()
+                            ));
+                            self.skipped += 1;
+                            continue;
+                        }
+                        return Ok(Some(RawRead {
+                            name: self.fasta_record.id().to_string(),
+                            seq: self.fasta_record.seq().to_ascii_uppercase(),
+                        }));
+                    }
+                    Err(e) => {
+                        self.index += 1;
+                        self.skipped += 1;
+                        self.consecutive_errors += 1;
+                        // The name is only known if the parser reached the header line.
+                        if self.fasta_record.id().is_empty() {
+                            warn(format!(
+                                "skipping malformed record {} in '{}': {e}",
+                                self.index,
+                                self.filename.display()
+                            ));
+                        } else {
+                            warn(format!(
+                                "skipping malformed read '{}' in '{}': {e}",
+                                self.fasta_record.id(),
+                                self.filename.display()
+                            ));
+                        }
+                        if self.consecutive_errors >= MAX_CONSECUTIVE_BAD_RECORDS {
+                            return Err(format!(
+                                "Gave up on '{}' after {} malformed records in a row. The file \
+                                 is probably truncated or not FASTA at all.",
+                                self.filename.display(),
+                                self.consecutive_errors
+                            ));
+                        }
+                    }
+                }
+            },
             Source::Fastq(reader) => loop {
                 match reader.read(&mut self.record) {
                     Ok(()) => {
@@ -1087,12 +1424,21 @@ fn anchor_failure(start_found: bool, end_found: bool) -> Rejected {
     }
 }
 
-/// Classify which segments and their orientations are present within a read.
+/// One segment found in a read: the name it is reported under, with a trailing `*` if it
+/// was found on the reverse strand, and the half-open span of the extracted sequence it
+/// covers.
+struct FoundSegment {
+    name: String,
+    start: usize,
+    end: usize,
+}
+
+/// The segments found in a read, in the order they occur along it.
 ///
 /// With `start_end_segs` the read has already been trimmed to run from 'start' to 'end',
-/// so those two bound the segment string instead of being searched for within it.
-/// Without it the read is classified as given and a segment named 'start' or 'end' is
-/// treated like any other.
+/// so those two are not searched for within it; [`segment_string`] adds them back as the
+/// bounds. Without it the read is classified as given and a segment named 'start' or
+/// 'end' is treated like any other.
 ///
 /// Each segment is found at its own threshold, resolved when the segments file was
 /// loaded, so there is no global score to apply here.
@@ -1100,7 +1446,7 @@ fn classify_read_segments(
     segments: &HashMap<String, Segment>,
     read_seq: &[u8],
     start_end_segs: bool,
-) -> String {
+) -> Vec<FoundSegment> {
     let aligner = MultiTracebackAligner::new(
         2,  // match score
         -1, // mismatch score
@@ -1174,30 +1520,100 @@ fn classify_read_segments(
         }
     }
     all_alignments.sort_by_key(|a| a.target_start);
-    // Generate the segment string, bounded by the anchors only if the user supplied them
-    let mut seg_names: Vec<&str> = Vec::new();
-    if start_end_segs {
-        seg_names.push("start");
+    all_alignments
+        .into_iter()
+        .filter(|aln| !aln.filter)
+        .map(|aln| FoundSegment {
+            name: aln.name,
+            start: aln.target_start,
+            end: aln.target_end,
+        })
+        .collect()
+}
+
+/// The segment string: the names in read order joined by `-`.
+fn segment_string(found: &[FoundSegment]) -> String {
+    found
+        .iter()
+        .map(|segment| segment.name.as_str())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+/// The same segments with the span each covers, as `seg1[1:13],seg2*[15:20]`.
+///
+/// Entries are separated by commas and the two positions within one by a colon, so the
+/// column can be split on `,` without the separators being confused for one another.
+///
+/// Positions are 1-based and inclusive of both ends, counted along the extracted sequence
+/// written beside them rather than along the read as it arrived - with `--start-end-segs`
+/// the two differ, since the read has been trimmed and possibly reoriented by then.
+fn located_segment_string(found: &[FoundSegment]) -> String {
+    found
+        .iter()
+        .map(|segment| format!("{}[{}:{}]", segment.name, segment.start + 1, segment.end))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Classify one extracted sequence and package it for output.
+///
+/// `clean_seq` is the read as it is actually classified: the whole read when no anchors
+/// were given, and the trimmed, reoriented span between them when they were. That is the
+/// sequence `--detailed-output` writes and the one the positions beside it are counted
+/// along, so the three columns always describe the same thing.
+///
+/// `anchor_spans` carries how much of `clean_seq` the 'start' and 'end' anchors take up,
+/// and is `None` when the read was classified without anchors. The extracted sequence
+/// runs from the first base of 'start' to the last base of 'end' whichever strand the
+/// read arrived on, so the anchors are always its two ends and their spans follow from
+/// their lengths alone.
+fn classified_read(
+    read_name: String,
+    clean_seq: &[u8],
+    segments: &HashMap<String, Segment>,
+    anchor_spans: Option<(usize, usize)>,
+    detailed: bool,
+) -> SegmentedRead {
+    let mut found = classify_read_segments(segments, clean_seq, anchor_spans.is_some());
+    if let Some((start_span, end_span)) = anchor_spans {
+        // Put back at their known positions rather than searched for: they were located
+        // once already, to trim the read to them.
+        found.insert(
+            0,
+            FoundSegment {
+                name: "start".to_string(),
+                start: 0,
+                end: start_span,
+            },
+        );
+        found.push(FoundSegment {
+            name: "end".to_string(),
+            // Saturating because a pathological read could align both anchors across
+            // more bases than lie between them; better a clamped span than a panic.
+            start: clean_seq.len().saturating_sub(end_span),
+            end: clean_seq.len(),
+        });
     }
-    for aln in &all_alignments {
-        if aln.filter {
-            continue;
-        }
-        seg_names.push(aln.name.as_str());
+    SegmentedRead {
+        name: read_name,
+        segments: segment_string(&found),
+        detail: detailed.then(|| ReadDetail {
+            located: located_segment_string(&found),
+            sequence: String::from_utf8_lossy(clean_seq).into_owned(),
+        }),
     }
-    if start_end_segs {
-        seg_names.push("end");
-    }
-    seg_names.join("-")
 }
 
 /// Classify segments across all reads loaded from a sequences file (FASTQ or BAM).
 fn process_reads(
     records: Vec<RawRead>,
     segments: &HashMap<String, Segment>,
+    // Minimum and maximum read length, where zero on either side means no bound there.
     len_check: (usize, usize),
     circular: bool,
     start_end_segs: bool,
+    detailed: bool,
 ) -> Result<(Vec<SegmentedRead>, RunSummary)> {
     // Precompute start/end revcomps and score minimums once rather than per-read
     let start_end_seqs: Option<AnchorSeqs> = if start_end_segs {
@@ -1230,21 +1646,21 @@ fn process_reads(
             let read_seq = record.seq.clone();
 
             let read_len = read_seq.len();
-            if len_check != (0, 0) && read_len < len_check.0 {
+            // Zero means no bound on that side, independently of the other, so a
+            // minimum can be set without also having to invent a maximum.
+            if len_check.0 > 0 && read_len < len_check.0 {
                 return Outcome::Rejected(Rejected::TooShort);
             }
-            if len_check != (0, 0) && read_len > len_check.1 {
+            if len_check.1 > 0 && read_len > len_check.1 {
                 return Outcome::Rejected(Rejected::TooLong);
             }
 
             if !start_end_segs {
                 // No anchors: classify the read as it arrived, on whichever strand.
                 let clean_seq = cut_reorient_seq(&read_seq, 0, read_seq.len(), false);
-                let seg_str = classify_read_segments(segments, &clean_seq, start_end_segs);
-                Outcome::Classified(SegmentedRead {
-                    name: read_name,
-                    segments: seg_str,
-                })
+                Outcome::Classified(classified_read(
+                    read_name, &clean_seq, segments, None, detailed,
+                ))
             } else if let Some(anchors) = start_end_seqs.as_ref() {
                 let anchor = |seq: &[u8]| best_semiglobal(seq, &read_seq, ANCHOR_SCORING);
                 let align_start = anchor(&anchors.start);
@@ -1277,11 +1693,16 @@ fn process_reads(
                         }
                         let clean_seq =
                             cut_reorient_seq(&new_read_seq, start_seg_pos, end_seg_pos, false);
-                        let seg_str = classify_read_segments(segments, &clean_seq, start_end_segs);
-                        Outcome::Classified(SegmentedRead {
-                            name: read_name,
-                            segments: seg_str,
-                        })
+                        Outcome::Classified(classified_read(
+                            read_name,
+                            &clean_seq,
+                            segments,
+                            Some((
+                                align_start.yend - align_start.ystart,
+                                align_end.yend - align_end.ystart,
+                            )),
+                            detailed,
+                        ))
                     } else {
                         Outcome::Rejected(anchor_failure(
                             align_start.score.max(align_start_rc.score) >= start_min,
@@ -1311,11 +1732,16 @@ fn process_reads(
                         }
                         let clean_seq =
                             cut_reorient_seq(&new_read_seq, start_seg_pos, end_seg_pos, true);
-                        let seg_str = classify_read_segments(segments, &clean_seq, start_end_segs);
-                        Outcome::Classified(SegmentedRead {
-                            name: read_name,
-                            segments: seg_str,
-                        })
+                        Outcome::Classified(classified_read(
+                            read_name,
+                            &clean_seq,
+                            segments,
+                            Some((
+                                align_start_rc.yend - align_start_rc.ystart,
+                                align_end_rc.yend - align_end_rc.ystart,
+                            )),
+                            detailed,
+                        ))
                     } else {
                         Outcome::Rejected(anchor_failure(
                             align_start.score.max(align_start_rc.score) >= start_min,
@@ -1470,12 +1896,13 @@ struct Cli {
     #[arg(long)]
     sequences: String,
 
-    /// Minimum read length to process
-    #[arg(long, default_value_t = 100)]
+    /// Minimum read length to process. Zero means no minimum, which is the default: no
+    /// read is dropped for its length unless a bound is asked for
+    #[arg(long, default_value_t = 0)]
     min_seq_len: usize,
 
-    /// Maximum read length to process
-    #[arg(long, default_value_t = 100000)]
+    /// Maximum read length to process. Zero means no maximum, which is the default
+    #[arg(long, default_value_t = 0)]
     max_seq_len: usize,
 
     /// Use the 'start' and 'end' segments to anchor, trim and orient each read. They
@@ -1513,6 +1940,11 @@ struct Cli {
     /// most frequent first
     #[arg(long)]
     counts: Option<String>,
+
+    /// Add two columns to the classifications file: where each segment sits in the
+    /// extracted sequence, as 'seg1[1,13],seg2*[15,20]', and that sequence itself
+    #[arg(long, default_value_t = false)]
+    detailed_output: bool,
 }
 
 /// Run the tool, reporting any failure on stderr and exiting non-zero.
@@ -1526,6 +1958,10 @@ fn main() {
 /// Load the inputs, classify every read, write the results and report the summary.
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    // Both clocks: the wall clock for the timestamps a person reads, and a monotonic one
+    // for the elapsed time, which must not be thrown off by the clock being adjusted.
+    let started = SystemTime::now();
+    let start_instant = Instant::now();
 
     if !(0.0..=2.0).contains(&cli.min_norm_score) {
         return Err(format!(
@@ -1533,7 +1969,9 @@ fn run() -> Result<()> {
             cli.min_norm_score
         ));
     }
-    if cli.min_seq_len > cli.max_seq_len {
+    // Only meaningful when there is an upper bound: with --max-seq-len at its default of
+    // zero there is nothing for the minimum to exceed.
+    if cli.max_seq_len > 0 && cli.min_seq_len > cli.max_seq_len {
         return Err(format!(
             "--min-seq-len ({}) is greater than --max-seq-len ({}), so no read could ever be kept.",
             cli.min_seq_len, cli.max_seq_len
@@ -1604,21 +2042,34 @@ fn run() -> Result<()> {
     let mut summary = RunSummary::default();
     let mut classifications = ClassificationCounts::default();
     let mut reads_seen = 0usize;
+    let mut bases_seen = 0u64;
     loop {
         let chunk = stream.next_chunk(MAX_CHUNK_BASES, MAX_CHUNK_READS)?;
         if chunk.is_empty() {
             break;
         }
         reads_seen += chunk.len();
+        bases_seen += chunk
+            .iter()
+            .map(|record| record.seq.len() as u64)
+            .sum::<u64>();
         let (clean_seqs, chunk_summary) = process_reads(
             chunk,
             &segments,
             (cli.min_seq_len, cli.max_seq_len),
             cli.circular,
             cli.start_end_segs,
+            cli.detailed_output,
         )?;
         for r in clean_seqs {
-            writeln!(f, "{}\t{}", r.name, r.segments).map_err(|e| {
+            let row = match &r.detail {
+                Some(detail) => format!(
+                    "{}\t{}\t{}\t{}",
+                    r.name, r.segments, detail.located, detail.sequence
+                ),
+                None => format!("{}\t{}", r.name, r.segments),
+            };
+            writeln!(f, "{row}").map_err(|e| {
                 format!(
                     "Could not write to classifications file '{}': {e}",
                     cli.classifications
@@ -1659,6 +2110,45 @@ fn run() -> Result<()> {
         ));
     }
     summary.unreadable = stream.skipped;
-    eprint!("{}", summary.render());
+
+    let on_off = |enabled: bool| if enabled { "on" } else { "off" }.to_string();
+    let report = RunReport {
+        started,
+        finished: SystemTime::now(),
+        elapsed: start_instant.elapsed(),
+        segments_file: cli.segments.clone(),
+        segments_loaded: segments.len(),
+        sequences_file: cli.sequences.clone(),
+        sequences_format: stream.format,
+        sequences_bytes: total_bytes,
+        reads: reads_seen,
+        bases: bases_seen,
+        // Every option at the value it actually ran with, so the report is a record of
+        // what produced the results beside it and not just of how they turned out.
+        options: vec![
+            (
+                "--min-norm-score".to_string(),
+                cli.min_norm_score.to_string(),
+            ),
+            (
+                "--per-segment-scores".to_string(),
+                on_off(cli.per_segment_scores),
+            ),
+            ("--start-end-segs".to_string(), on_off(cli.start_end_segs)),
+            ("--circular".to_string(), on_off(cli.circular)),
+            ("--min-seq-len".to_string(), cli.min_seq_len.to_string()),
+            ("--max-seq-len".to_string(), cli.max_seq_len.to_string()),
+            ("--threads".to_string(), cli.threads.to_string()),
+            ("--detailed-output".to_string(), on_off(cli.detailed_output)),
+            ("--classifications".to_string(), cli.classifications.clone()),
+            (
+                "--counts".to_string(),
+                cli.counts
+                    .clone()
+                    .unwrap_or_else(|| "(not written)".to_string()),
+            ),
+        ],
+    };
+    print!("{}", report.render(&summary));
     Ok(())
 }
