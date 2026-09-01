@@ -60,7 +60,7 @@ By default every read is classified exactly as it arrives. Passing `-d/--start-e
 | `-h`, `--help` | | Print help. |
 | `-V`, `--version` | | Print version. |
 
-Peak memory does not grow with the size of the input. Reads are streamed through in bounded chunks, and all alignment runs in space linear in the read length and independent of segment length, so long segments and long anchors cost no more than short ones. The practical ceiling is a single very long read, not the file.
+Peak memory does not grow with the size of the input. Reads are streamed through in bounded chunks, and all alignment runs in space linear in the read length and independent of segment length, so long segments and long anchors cost no more than short ones. The practical ceiling is a single very long read, not the file. `--detailed-output` roughly doubles what a chunk holds, since it carries each read's extracted sequence until the chunk is written, but the chunk is still bounded.
 
 ## Example
 
@@ -87,18 +87,18 @@ c689dd31-4e98-4154-ab05-a8b0abed9436	start-end
 ...
 ```
 
-and a summary of the run is printed to stderr:
+and a report of the run is printed to stdout. Its read accounting looks like this — see [Run report](#run-report) for the rest of it:
 
 ```
 Summary
-  reads read:            100
-  classified:             62  (62.0%)
-  not classified:         38  (38.0%)
-    read too short                           10
-    read too long                             8
-    'start' segment not found                 2
-    'end' segment not found                  17
-    neither segment found                     1
+  reads read:                  100
+  classified:                   62  (62.0%)
+  not classified:               38  (38.0%)
+    read too short              10
+    read too long                8
+    'start' segment not found    2
+    'end' segment not found     17
+    neither segment found        1
 ```
 
 This should run very quickly and take less than a minute to run on a standard desktop machine.
@@ -256,7 +256,7 @@ start-attP_Bxb1-attB_Tp901*-end
 start-end                          ← anchors found, nothing in between
 ```
 
-Note that reads which are filtered out do not appear in the output at all. A read is dropped if it falls outside the length bounds, or — with `-d` — if either anchor is missing, too degraded to score above the threshold, or in an inconsistent order. The [run summary](#run-summary) accounts for every one of them.
+Note that reads which are filtered out do not appear in the output at all. A read is dropped if it falls outside the length bounds, or — with `-d` — if either anchor is missing, too degraded to score above the threshold, or in an inconsistent order. The [run report](#run-report) accounts for every one of them.
 
 Results are deterministic: the same input, segments and settings always produce byte-identical output, including the order of lines, regardless of `--threads`.
 
@@ -271,16 +271,16 @@ While running, a progress bar on stderr shows how much of the file has been cons
 ```
 
 ```
-read1   start-attB_Tp901-attP_Bxb1*-end   attB_Tp901[21,73],attP_Bxb1*[95,142]   CTCGGATACC…
+ad6f445e   start-attP_Bxb1*-end   start[1:40],attP_Bxb1*[929:978],end[979:1018]   CTCGGATACCCTTA…
 ```
 
-**Located segments** repeats the segment string with the span each hit covers, `name[start,end]`, comma separated and in the same order. Positions are **1-based and inclusive of both ends**, so `attB_Tp901[21,73]` is 53 bases long and `sequence[21..=73]` cuts it out. Reverse-strand hits keep the same trailing `*` they have in the segment string. A read with no segments above the threshold gets an empty column rather than a missing one, so every row has the same number of columns.
+**Located segments** repeats the segment string with the span each hit covers, and does so name for name: every name in the segment string has an entry here, in the same order. Entries are separated by commas, and the two positions within an entry by a colon, so the column can be split on `,` without the two separators being confused for one another.
 
-The anchors are left out of this column even though the segment string names them: with `-d` they are the two ends of the extracted sequence by construction, so a span for them would say nothing the sequence does not.
+Positions are **1-based and inclusive of both ends**, counted along the extracted sequence in the next column. So `attP_Bxb1*[929:978]` is 50 bases and `sequence[929..=978]` cuts it out. Reverse-strand hits keep the same trailing `*` they have in the segment string. A read with no segments above the threshold gets an empty column rather than a missing one, so every row has the same number of columns.
 
-**Extracted sequence** is the read exactly as it was classified — the whole read when no anchors were given, and the trimmed, reoriented span from `start` to `end` (anchors included) when they were. This matters for the positions beside it: with `-d` a read sequenced backwards is reverse complemented before classification, so both strands of the same molecule produce identical positions, counted along the sequence in the column rather than along the read as it arrived.
+With `-d/--start-end-segs` the anchors are reported here too. They are always the two ends of the extracted sequence — `start` opens it and `end` closes it — but the *spans* are worth having: they are what the anchors actually aligned across, so an anchor that matched short or long shows up here rather than having to be inferred. In the example above `start[1:40]` covers all 40 bases of the anchor, while a read whose anchor aligned with a deletion would report 39.
 
-> **Parsing note.** The separator between entries is a comma, and so is the separator inside the brackets, so splitting the column on `,` alone will not work. Split on `],` instead, or match `([^,\[\]]+)\[(\d+),(\d+)\]`.
+**Extracted sequence** is the read exactly as it was classified — the whole read when no anchors were given, and the trimmed, reoriented span from `start` to `end` (anchors included) when they were. This is what makes the positions well defined: with `-d` a read sequenced backwards is reverse complemented before classification, so both strands of the same molecule produce identical positions, counted along the sequence in the column rather than along the read as it arrived.
 
 Because the extracted sequence is carried alongside each read until its chunk is written, this roughly doubles what a chunk holds in memory. Chunks are bounded, so the ceiling does not grow with the size of the input.
 
@@ -304,7 +304,7 @@ start-attB_Int5-attB_BxB1*-attP_Int5*-attP_Tp901-attP_Bxb1*-end,1
 
 Rows are ordered by count, most frequent first, with equal counts ordered alphabetically so that two runs over the same reads produce byte-identical files and a diff between two conditions stays readable.
 
-The counts cover the reads that were *classified*, and so add up to the number of lines in the results file rather than to the number of reads in the input. Reads dropped for their length or for a missing anchor never reach a classification and are accounted for in the [run summary](#run-summary) on stderr instead. A read that was classified but carried no recognisable segments is a real result and gets a row with an empty first field.
+The counts cover the reads that were *classified*, and so add up to the number of lines in the results file rather than to the number of reads in the input. Reads dropped for their length or for a missing anchor never reach a classification and are accounted for in the [run report](#run-report) instead. A read that was classified but carried no recognisable segments is a real result and gets a row with an empty first field.
 
 A run that classified nothing still writes the header row, so the file is always valid CSV. Fields are quoted where a segment name contains a comma, a quote or a newline.
 
@@ -388,25 +388,58 @@ it almost anywhere. Use a more specific sequence, or raise the score it is found
 
 This is a warning rather than an error, since a mostly degenerate probe is a legitimate thing to search for. Each segment is judged against its own threshold, so giving just that segment a stricter one with [`--per-segment-scores`](#per-segment-thresholds) both silences the warning and fixes what it is warning about, without making every other segment stricter.
 
-## Run summary
+## Run report
 
-At the end of every run a summary is written to stderr, accounting for every read:
+At the end of every run a report is written to **stdout**, describing what went in, how the run was configured, how the reads were accounted for, and how fast it went:
 
 ```
+Run
+  started                      2026-09-01 18:24:13 UTC
+  finished                     2026-09-01 18:24:13 UTC
+  elapsed                      0.31 s
+
+Input
+  segments file                data/refs.fasta
+  segments loaded                8
+  sequences file               data/reads.fastq
+  sequences format             FASTQ
+  sequences size               270.4 KiB
+
+Options
+  --min-norm-score             1.5
+  --per-segment-scores         off
+  --start-end-segs             on
+  --circular                   off
+  --min-seq-len                100
+  --max-seq-len                100000
+  --threads                    1
+  --detailed-output            off
+  --classifications            classifications.txt
+  --counts                     (not written)
+
 Summary
-  reads read:                               10
-  classified:                                4  (40.0%)
-  not classified:                            6  (60.0%)
-    read too short                           1
-    'start' segment not found                1
-    'end' segment not found                  1
-    neither segment found                    1
-    'start'/'end' on opposite strands        1
-    'start'/'end' out of order               1
-  records skipped while reading the input:   1
+  reads read:                  100
+  classified:                   70  (70.0%)
+  not classified:               30  (30.0%)
+    'start' segment not found    2
+    'end' segment not found     24
+    neither segment found        4
+
+Throughput
+  bases read                   126.0 kbase
+  reads per second             321
+  bases per second             404.0 kbase
 ```
 
-Classified and not-classified always add back up to the number of reads, and each rejected read is counted under exactly one reason. Categories that did not occur are left out, so a run with no anchoring shows only the length rejections.
+**Run** timestamps the run. Times are UTC so they sort and compare without ambiguity about the machine's timezone. `elapsed` is measured on a monotonic clock, so an adjustment to the system clock mid-run cannot distort it.
+
+**Input** names both files, how many segments were loaded from the first, and the detected format and size of the second — so a report says which files produced it, not just what came out.
+
+**Options** lists *every* option at the value it actually ran with, including the ones left at their defaults. Together with the input section this makes the report a record of what produced the results beside it, which is what makes a run reproducible from its own output.
+
+**Summary** accounts for every read. Classified and not-classified always add back up to the number of reads, and each rejected read is counted under exactly one reason. Categories that did not occur are left out, so a run with no anchoring shows only the length rejections.
+
+**Throughput** is the rate over the whole run, loading included. A run too short for the clock to measure quotes no rate rather than an infinity.
 
 Every count shares one column whatever its nesting depth, and the columns are measured from the rows actually being printed, so a run of a hundred reads and a run of ten million both come out square:
 
@@ -427,7 +460,14 @@ Summary
 | `'start'/'end' out of order` | Both anchors found on the same strand, but `end` precedes `start`. Add `--circular` if the template is circular and these reads cross the origin. |
 | `records skipped while reading the input` | Malformed, unnamed or sequence-less records skipped during loading. Each is also warned about individually. |
 
-Anchor-related reasons only arise with `-d/--start-end-segs`. Because the summary goes to stderr it never mixes with the results file, and `2>run.log` captures it together with any warnings.
+Anchor-related reasons only arise with `-d/--start-end-segs`.
+
+The report goes to stdout while warnings go to stderr, and the results go to their own file, so the three can be captured separately. Nothing else is written to stdout, so `> run.txt` keeps the report and nothing but the report:
+
+```sh
+segment --segments refs.fasta --sequences reads.fastq -d \
+        --classifications results.txt > run.txt 2> warnings.log
+```
 
 ## Errors and warnings
 
@@ -440,7 +480,7 @@ error: Segment 'attB_Tp901' is defined more than once in 'parts.fasta'. Segment 
 must be unique, otherwise it is ambiguous which sequence should be searched for.
 ```
 
-**Warnings** go to stderr and processing continues. On startup, a segment [degenerate enough to match random sequence](#thresholds-and-ambiguous-bases) is named, as is one that [asks for a threshold](#per-segment-thresholds) without `--per-segment-scores` to apply it. An individual malformed or unusable record is skipped, named where possible, and a summary is printed once the file is read:
+**Warnings** go to stderr and processing continues. On startup, a segment [degenerate enough to match random sequence](#thresholds-and-ambiguous-bases) is named, as is one that [asks for a threshold](#per-segment-thresholds) without `--per-segment-scores` to apply it. An individual malformed or unusable record is skipped, named where possible, and a count of them is printed once the file is read:
 
 ```
 warning: skipping malformed read 'ad6f445e' in 'reads.fastq': Incomplete record. ...

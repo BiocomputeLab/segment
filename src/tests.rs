@@ -93,18 +93,26 @@ fn load_scored(path: &Path) -> Result<HashMap<String, Segment>> {
 
 /// Classify a read exactly as given, with no start/end anchors supplied.
 fn classify(segments: &[(&str, &str)], read: &str) -> String {
-    segment_string(
-        &classify_read_segments(&seg_map(segments), read.as_bytes(), false),
+    segment_string(&classify_read_segments(
+        &seg_map(segments),
+        read.as_bytes(),
         false,
-    )
+    ))
 }
 
 /// Classify a read that has already been trimmed to run from 'start' to 'end'.
 fn classify_anchored(segments: &[(&str, &str)], read: &str) -> String {
-    segment_string(
-        &classify_read_segments(&seg_map(segments), read.as_bytes(), true),
-        true,
+    // Zero-length anchor spans: these fixtures are the interior of a trimmed read, so
+    // the anchors bound it without occupying any of it. `classified_read` is what puts
+    // them back, so going through it keeps the helper honest about where they come from.
+    classified_read(
+        "read".to_string(),
+        read.as_bytes(),
+        &seg_map(segments),
+        Some((0, 0)),
+        false,
     )
+    .segments
 }
 
 /// `cut_reorient_seq` over strings, for readable expectations.
@@ -1012,14 +1020,11 @@ fn a_bracketed_score_decides_whether_a_segment_is_found() {
     assert_hit_above_threshold(SEG_A, &read, (12, 32), 37);
 
     let classify_at = |min_norm_score: f32| {
-        segment_string(
-            &classify_read_segments(
-                &seg_map_scored(&[("A", SEG_A, min_norm_score)]),
-                read.as_bytes(),
-                false,
-            ),
+        segment_string(&classify_read_segments(
+            &seg_map_scored(&[("A", SEG_A, min_norm_score)]),
+            read.as_bytes(),
             false,
-        )
+        ))
     };
     assert_eq!(classify_at(1.8), "A", "37/20 = 1.85 clears 1.8");
     assert_eq!(classify_at(1.9), "", "...and falls short of 1.9");
@@ -1039,10 +1044,7 @@ fn each_segment_is_found_at_its_own_threshold() {
     );
     let segments = seg_map_scored(&[("strict", SEG_A, 1.9), ("lenient", SEG_B, 1.8)]);
     assert_eq!(
-        segment_string(
-            &classify_read_segments(&segments, read.as_bytes(), false),
-            false
-        ),
+        segment_string(&classify_read_segments(&segments, read.as_bytes(), false)),
         "lenient"
     );
 }
@@ -2464,32 +2466,23 @@ fn byte_progress_tracks_the_file_for_every_format() {
 // Detailed output
 // ---------------------------------------------------------------------------
 
-/// Pull the spans out of a located string, which cannot be split on ',' alone because
-/// the separator between entries is also the separator inside the brackets.
+/// Pull the spans out of a located string. Entries are comma separated and the two
+/// positions within one are separated by a colon, so a plain split on ',' is enough -
+/// which is the point of the colon, and is asserted on directly below.
 fn located_spans(located: &str) -> Vec<(String, usize, usize)> {
     if located.is_empty() {
         return Vec::new();
     }
     located
-        .split_inclusive(',')
-        .map(|entry| entry.trim_end_matches(','))
-        // Entries end in ']', so a piece that does not is the first half of one span.
-        .fold(Vec::new(), |mut pieces: Vec<String>, piece| {
-            match pieces.last_mut() {
-                Some(last) if !last.ends_with(']') => {
-                    last.push(',');
-                    last.push_str(piece);
-                }
-                _ => pieces.push(piece.to_string()),
-            }
-            pieces
-        })
-        .iter()
+        .split(',')
         .map(|entry| {
             let (name, span) = entry
                 .split_once('[')
-                .expect("an entry looks like name[a,b]");
-            let (start, end) = span.trim_end_matches(']').split_once(',').unwrap();
+                .expect("an entry looks like name[a:b]");
+            let (start, end) = span
+                .trim_end_matches(']')
+                .split_once(':')
+                .expect("positions are separated by a colon");
             (
                 name.to_string(),
                 start.parse().unwrap(),
@@ -2497,6 +2490,20 @@ fn located_spans(located: &str) -> Vec<(String, usize, usize)> {
             )
         })
         .collect()
+}
+
+/// The separator between entries and the separator within one are different characters,
+/// so splitting the column on ',' can never cut an entry in half.
+#[test]
+fn entries_are_separated_differently_from_the_positions_within_them() {
+    let read = format!("{}{}{}{}", SEG_A, SPACER, SEG_B, SEG_A);
+    let (_, located, _) = run_detailed(&read, &[("A", SEG_A), ("B", SEG_B)], false, false);
+    assert_eq!(located, "A[1:20],B[33:52],A[53:72]");
+    assert_eq!(
+        located.split(',').count(),
+        3,
+        "a plain comma split yields one piece per segment: {located}"
+    );
 }
 
 /// Without the flag there is no detail to write, so the extra columns cost nothing on a
@@ -2526,7 +2533,7 @@ fn positions_are_one_based_and_index_the_sequence_column() {
 
     assert_eq!(segments, "A");
     // SPACER is 12 bp, so a 20 bp segment planted after it runs from 13 to 32.
-    assert_eq!(located, "A[13,32]");
+    assert_eq!(located, "A[13:32]");
     let (_, start, end) = located_spans(&located)[0].clone();
     assert_eq!(&sequence[start - 1..end], SEG_A, "the span cuts out SEG_A");
     assert_eq!(end - start + 1, SEG_A.len(), "inclusive of both ends");
@@ -2541,7 +2548,7 @@ fn every_occurrence_gets_its_own_entry_in_read_order() {
         run_detailed(&read, &[("A", SEG_A), ("B", SEG_B)], false, false);
 
     assert_eq!(segments, "A-B-A");
-    assert_eq!(located, "A[1,20],B[33,52],A[53,72]");
+    assert_eq!(located, "A[1:20],B[33:52],A[53:72]");
     let spans = located_spans(&located);
     assert_eq!(
         spans
@@ -2565,7 +2572,7 @@ fn reverse_strand_segments_keep_their_star() {
     let (segments, located, sequence) = run_detailed(&read, &[("A", SEG_A)], false, false);
 
     assert_eq!(segments, "A*");
-    assert_eq!(located, "A*[13,32]");
+    assert_eq!(located, "A*[13:32]");
     assert_eq!(
         &sequence[12..32],
         rc(SEG_A),
@@ -2591,14 +2598,13 @@ fn the_sequence_is_the_whole_read_when_there_are_no_anchors() {
     let (_, located, sequence) = run_detailed(&read, &[("A", SEG_A)], false, false);
     assert_eq!(sequence, read);
     assert_eq!(
-        located, "A[11,30]",
+        located, "A[11:30]",
         "JUNK_5 is 10 bp, so SEG_A starts at 11"
     );
 }
 
 /// With anchors the extracted sequence is the trimmed span between them, and the
-/// positions count along that rather than along the read as it arrived. The anchors are
-/// left out of the located column: they are its two ends by construction.
+/// positions count along that rather than along the read as it arrived.
 #[test]
 fn the_sequence_is_trimmed_to_the_anchors_and_positions_follow_it() {
     let read = format!("{}{}{}", JUNK_5, construct(), JUNK_3);
@@ -2611,10 +2617,56 @@ fn the_sequence_is_trimmed_to_the_anchors_and_positions_follow_it() {
         "trimmed to the anchors, junk removed"
     );
     // Positions along the construct, not the read: START is 20 bp, so A begins at 21.
-    assert_eq!(located, "A[21,40],B[53,72]");
+    assert_eq!(located, "start[1:20],A[21:40],B[53:72],end[73:92]");
     assert_eq!(&sequence[20..40], SEG_A);
     assert_eq!(&sequence[52..72], SEG_B);
-    assert!(!located.contains("start"), "anchors are omitted: {located}");
+}
+
+/// The anchors are located like everything else, so the two columns match name for name
+/// and the anchors bound the sequence exactly: 'start' opens it and 'end' closes it.
+/// Reporting them is what lets a run be diagnosed from the output alone - a trimmed read
+/// that looks wrong can be traced to where the anchors were actually found.
+#[test]
+fn the_anchors_are_located_like_any_other_segment() {
+    let read = format!("{}{}{}", JUNK_5, construct(), JUNK_3);
+    let (segments, located, sequence) = run_detailed(&read, &anchored_segments(), false, true);
+
+    let spans = located_spans(&located);
+    assert_eq!(
+        spans
+            .iter()
+            .map(|(name, ..)| name.as_str())
+            .collect::<Vec<_>>(),
+        segments.split('-').collect::<Vec<_>>(),
+        "every name in the segment string has a span beside it"
+    );
+    let (first, last) = (spans.first().unwrap(), spans.last().unwrap());
+    assert_eq!((first.0.as_str(), first.1), ("start", 1), "start opens it");
+    assert_eq!(
+        (last.0.as_str(), last.2),
+        ("end", sequence.len()),
+        "end closes it"
+    );
+    // ...and the anchor spans cut the anchors back out.
+    assert_eq!(&sequence[first.1 - 1..first.2], START);
+    assert_eq!(&sequence[last.1 - 1..last.2], END);
+}
+
+/// An anchor that aligned across a different number of bases than it is long reports the
+/// span it actually covered, not its nominal length. That is the point of reporting them:
+/// a degraded anchor shows up here rather than having to be inferred.
+#[test]
+fn an_anchor_span_reflects_the_alignment_not_the_anchor_length() {
+    // A read whose start anchor is missing its first base, flush with the read start so
+    // there is nothing before it for the aligner to absorb that base against.
+    let read = format!("{}{}{}", &START[1..], SEG_A, END);
+    let (segments, located, sequence) = run_detailed(&read, &anchored_segments(), false, true);
+
+    assert_eq!(segments, "start-A-end");
+    let spans = located_spans(&located);
+    assert_eq!(spans[0], ("start".to_string(), 1, 19), "19 bases, not 20");
+    assert_eq!(sequence.len(), 19 + SEG_A.len() + END.len());
+    assert_eq!(&sequence[..19], &START[1..]);
 }
 
 /// A read sequenced the other way round is reoriented before classification, so the
@@ -2639,7 +2691,173 @@ fn a_wrapped_read_is_rotated_before_its_positions_are_taken() {
     let (_, located, sequence) =
         run_detailed(&rotated_construct(), &anchored_segments(), true, true);
     assert_eq!(sequence, construct(), "rotated back to start-...-end");
-    assert_eq!(located, "A[21,40],B[53,72]");
+    assert_eq!(located, "start[1:20],A[21:40],B[53:72],end[73:92]");
+}
+
+// ---------------------------------------------------------------------------
+// Report formatting
+// ---------------------------------------------------------------------------
+
+/// The calendar arithmetic behind the timestamps, checked against dates whose answers
+/// are known independently. Leap years and century rules are where a hand-rolled
+/// conversion goes wrong, so those are what is pinned.
+#[test]
+fn days_since_the_epoch_convert_to_the_right_calendar_date() {
+    for (days, expected) in [
+        (0, (1970, 1, 1)),
+        (1, (1970, 1, 2)),
+        (30, (1970, 1, 31)),
+        (31, (1970, 2, 1)),
+        (364, (1970, 12, 31)),
+        (365, (1971, 1, 1)),
+        // 1972 was a leap year, so it has a 29 February.
+        (789, (1972, 2, 29)),
+        (790, (1972, 3, 1)),
+        // 2000 was a leap year despite being a century: divisible by 400.
+        (11016, (2000, 2, 29)),
+        // 1900 was not, being a century that is not divisible by 400: 28 February is
+        // followed straight by 1 March.
+        (-25509, (1900, 2, 28)),
+        (-25508, (1900, 3, 1)),
+        (20000, (2024, 10, 4)),
+    ] {
+        assert_eq!(
+            civil_from_days(days),
+            expected,
+            "{days} days since the epoch"
+        );
+    }
+}
+
+/// Timestamps come out in a fixed, sortable form, and a time the clock cannot express
+/// says so rather than panicking.
+#[test]
+fn timestamps_are_formatted_as_sortable_utc() {
+    let at = |secs: u64| format_utc(SystemTime::UNIX_EPOCH + Duration::from_secs(secs));
+    assert_eq!(at(0), "1970-01-01 00:00:00 UTC");
+    assert_eq!(at(86_399), "1970-01-01 23:59:59 UTC");
+    assert_eq!(at(86_400), "1970-01-02 00:00:00 UTC");
+    assert_eq!(at(1_700_000_000), "2023-11-14 22:13:20 UTC");
+    // Sub-second precision is dropped rather than rounded up into the next second.
+    assert_eq!(
+        format_utc(SystemTime::UNIX_EPOCH + Duration::from_millis(999)),
+        "1970-01-01 00:00:00 UTC"
+    );
+    // A clock set before 1970 is not worth handling, but must not bring the run down
+    // after the work is already done.
+    assert_eq!(
+        format_utc(SystemTime::UNIX_EPOCH - Duration::from_secs(1)),
+        "unknown"
+    );
+}
+
+/// Sizes are quoted at a scale a person can read, with whole bytes left whole.
+#[test]
+fn byte_counts_are_scaled_for_reading() {
+    assert_eq!(human_bytes(0), "0 B");
+    assert_eq!(human_bytes(1023), "1023 B");
+    assert_eq!(human_bytes(1024), "1.0 KiB");
+    assert_eq!(human_bytes(1536), "1.5 KiB");
+    assert_eq!(human_bytes(1024 * 1024), "1.0 MiB");
+    assert_eq!(human_bytes(3 * 1024 * 1024 * 1024), "3.0 GiB");
+    // Beyond the largest unit it keeps scaling in that unit rather than wrapping round.
+    assert!(human_bytes(u64::MAX).ends_with(" TiB"));
+}
+
+/// Base counts scale by powers of ten, which is how sequence lengths are always quoted -
+/// unlike file sizes, which go in powers of two.
+#[test]
+fn base_counts_are_scaled_by_powers_of_ten() {
+    assert_eq!(human_bases(0.0), "0.0 base");
+    assert_eq!(human_bases(999.0), "999.0 base");
+    assert_eq!(human_bases(1_000.0), "1.0 kbase");
+    assert_eq!(human_bases(7_561_380.0), "7.6 Mbase");
+    assert_eq!(human_bases(2.5e9), "2.5 Gbase");
+}
+
+/// Durations stay in seconds while that reads well, then break into minutes and hours.
+#[test]
+fn durations_are_scaled_for_reading() {
+    let secs = |s: f64| human_duration(Duration::from_secs_f64(s));
+    assert_eq!(secs(0.0), "0.00 s");
+    assert_eq!(secs(0.314), "0.31 s");
+    assert_eq!(secs(59.99), "59.99 s");
+    assert_eq!(secs(60.0), "1 m 00 s");
+    assert_eq!(secs(3599.0), "59 m 59 s");
+    assert_eq!(secs(3600.0), "1 h 00 m 00 s");
+    assert_eq!(secs(7384.0), "2 h 03 m 04 s");
+}
+
+/// A run too fast for the clock to separate has no meaningful rate, so the rates are
+/// left out rather than printed as an infinity.
+#[test]
+fn a_run_with_no_elapsed_time_quotes_no_rate() {
+    let report = RunReport {
+        started: SystemTime::UNIX_EPOCH,
+        finished: SystemTime::UNIX_EPOCH,
+        elapsed: Duration::ZERO,
+        segments_file: "refs.fasta".to_string(),
+        segments_loaded: 2,
+        sequences_file: "reads.fastq".to_string(),
+        sequences_format: "FASTQ",
+        sequences_bytes: 0,
+        reads: 0,
+        bases: 0,
+        options: Vec::new(),
+    }
+    .render(&RunSummary::default());
+    assert!(!report.contains("per second"), "{report}");
+    assert!(
+        !report.contains("inf") && !report.contains("NaN"),
+        "{report}"
+    );
+    // Everything that does not depend on the clock is still there.
+    assert!(
+        report.contains("refs.fasta") && report.contains("FASTQ"),
+        "{report}"
+    );
+}
+
+/// The report is one document: the sections share a label column, so it reads as a
+/// table rather than as several tables stacked up.
+#[test]
+fn the_report_sections_share_one_label_column() {
+    let report = RunReport {
+        started: SystemTime::UNIX_EPOCH,
+        finished: SystemTime::UNIX_EPOCH + Duration::from_secs(2),
+        elapsed: Duration::from_secs(2),
+        segments_file: "refs.fasta".to_string(),
+        segments_loaded: 2,
+        sequences_file: "reads.fastq".to_string(),
+        sequences_format: "FASTQ",
+        sequences_bytes: 4096,
+        reads: 10,
+        bases: 1000,
+        options: vec![("--threads".to_string(), "4".to_string())],
+    }
+    .render(&RunSummary {
+        classified: 8,
+        too_short: 2,
+        ..Default::default()
+    });
+
+    // Values start where counts end: one column for the whole document.
+    let starts: Vec<usize> = report
+        .lines()
+        .filter(|line| line.starts_with("  ") && line.contains("  ") && !line.trim().is_empty())
+        .filter_map(|line| line.rfind("  ").map(|gap| gap + 2))
+        .collect();
+    assert!(
+        starts.len() > 8,
+        "expected rows from every section:\n{report}"
+    );
+    // Each section is introduced by a heading on its own line.
+    for heading in ["Run", "Input", "Options", "Summary", "Throughput"] {
+        assert!(
+            report.lines().any(|line| line == heading),
+            "missing the {heading} heading:\n{report}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::path::Path;
+use std::time::{Duration, Instant, SystemTime};
 
 #[cfg(test)]
 mod tests;
@@ -387,6 +388,88 @@ struct LoadedReads {
     skipped: usize,
 }
 
+/// Format a system time as `YYYY-MM-DD HH:MM:SS UTC`.
+///
+/// Done by hand rather than by pulling in a date library: the report only needs a
+/// timestamp a person can read, and UTC sidesteps needing the timezone database that the
+/// standard library cannot reach anyway.
+fn format_utc(time: SystemTime) -> String {
+    let Ok(since_epoch) = time.duration_since(SystemTime::UNIX_EPOCH) else {
+        // A clock set before 1970 is not worth handling, but is not worth crashing over.
+        return "unknown".to_string();
+    };
+    let secs = since_epoch.as_secs() as i64;
+    let (days, rest) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    let (year, month, day) = civil_from_days(days);
+    let (hour, minute, second) = (rest / 3600, (rest % 3600) / 60, rest % 60);
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} UTC")
+}
+
+/// Days since 1970-01-01 as a calendar date, by Howard Hinnant's `civil_from_days`.
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    // Shift the epoch to 0000-03-01 so that leap days fall at the end of the cycle.
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    (year, month, day)
+}
+
+/// A byte count at human scale, e.g. `1.4 MiB`.
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit + 1 < UNITS.len() {
+        size /= 1024.0;
+        unit += 1;
+    }
+    // Whole bytes are always whole; anything scaled reads better to one decimal place.
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{size:.1} {}", UNITS[unit])
+    }
+}
+
+/// A count of bases at human scale, e.g. `7.6 Mbase`. Decimal rather than binary, which
+/// is how sequence lengths are always quoted.
+fn human_bases(bases: f64) -> String {
+    const UNITS: [&str; 4] = ["base", "kbase", "Mbase", "Gbase"];
+    let mut size = bases;
+    let mut unit = 0;
+    while size >= 1000.0 && unit + 1 < UNITS.len() {
+        size /= 1000.0;
+        unit += 1;
+    }
+    format!("{size:.1} {}", UNITS[unit])
+}
+
+/// A duration at human scale: seconds while that stays readable, then minutes and hours.
+fn human_duration(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs_f64();
+    if secs < 60.0 {
+        return format!("{secs:.2} s");
+    }
+    let whole = elapsed.as_secs();
+    let (hours, minutes, seconds) = (whole / 3600, (whole % 3600) / 60, whole % 60);
+    if hours > 0 {
+        format!("{hours} h {minutes:02} m {seconds:02} s")
+    } else {
+        format!("{minutes} m {seconds:02} s")
+    }
+}
+
 /// Why a read produced no classification. Every read that is not classified falls into
 /// exactly one of these, so the counts in the summary always add up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -465,35 +548,28 @@ impl RunSummary {
         self.classified + self.not_classified()
     }
 
-    /// Render the end-of-run summary. Categories that cannot arise for the given
+    /// The read accounting as report rows. Categories that cannot arise for the given
     /// settings - the anchor ones without --start-end-segs, for instance - stay at zero
     /// and are left out, so the report only shows what actually happened.
-    ///
-    /// Every count lands in one column whatever its nesting depth, and the columns are
-    /// measured from the rows actually being printed rather than fixed, so a run of a
-    /// hundred reads and a run of ten million both come out square. Percentages are
-    /// right-aligned too, which lines up the decimal point.
-    fn render(&self) -> String {
+    fn rows(&self) -> Vec<Row> {
         // Blank unless there are reads to be a share of, which also drops the column.
-        let pct = |n: usize| -> String {
+        let share = |n: usize| -> String {
             if self.reads() == 0 {
                 String::new()
             } else {
                 format!("({:.1}%)", 100.0 * n as f64 / self.reads() as f64)
             }
         };
-
-        // Indent, label, count, and the share of all reads where one is meaningful. The
-        // breakdown rows are shares of the reads that were not classified rather than of
-        // every read, so quoting them against the same total would mislead.
-        let mut rows: Vec<(usize, &str, usize, String)> = vec![
-            (2, "reads read:", self.reads(), String::new()),
-            (2, "classified:", self.classified, pct(self.classified)),
-            (
+        // The breakdown rows are shares of the reads that were not classified rather
+        // than of every read, so quoting them against the same total would mislead.
+        let mut rows = vec![
+            Row::count(2, "reads read:", self.reads(), String::new()),
+            Row::count(2, "classified:", self.classified, share(self.classified)),
+            Row::count(
                 2,
                 "not classified:",
                 self.not_classified(),
-                pct(self.not_classified()),
+                share(self.not_classified()),
             ),
         ];
         for (label, count) in [
@@ -509,34 +585,29 @@ impl RunSummary {
             ("'start'/'end' out of order", self.anchors_out_of_order),
         ] {
             if count > 0 {
-                rows.push((4, label, count, String::new()));
+                rows.push(Row::count(4, label, count, String::new()));
             }
         }
         // Records that never became reads at all, so outside the accounting above.
         if self.unreadable > 0 {
-            rows.push((
+            rows.push(Row::count(
                 2,
                 "records skipped while reading the input:",
                 self.unreadable,
                 String::new(),
             ));
         }
+        rows
+    }
 
-        let width = |lengths: &mut dyn Iterator<Item = usize>| lengths.max().unwrap_or(0);
-        let label_width = width(&mut rows.iter().map(|(indent, label, ..)| indent + label.len()));
-        let count_width = width(&mut rows.iter().map(|(_, _, count, _)| count.to_string().len()));
-        let pct_width = width(&mut rows.iter().map(|(.., pct)| pct.len()));
-
-        let mut out = String::from("\nSummary\n");
-        for (indent, label, count, pct) in &rows {
-            let label = format!("{}{label}", " ".repeat(*indent));
-            out.push_str(&format!("{label:<label_width$}  {count:>count_width$}"));
-            if !pct.is_empty() {
-                out.push_str(&format!("  {pct:>pct_width$}"));
-            }
-            out.push('\n');
-        }
-        out
+    /// The read accounting on its own, laid out as [`render_rows`] describes. Production
+    /// renders it as one section of [`RunReport`]; this is how the tests get at the block
+    /// without building a whole report around it.
+    #[cfg(test)]
+    fn render(&self) -> String {
+        let mut rows = vec![Row::heading("Summary")];
+        rows.extend(self.rows());
+        render_rows(&rows)
     }
 }
 
@@ -592,11 +663,184 @@ fn csv_field(value: &str) -> String {
     }
 }
 
+/// One line of the end-of-run report: a heading, a labelled count to be right-aligned
+/// into the numbers column, or a labelled value that simply follows its label.
+enum Row {
+    Heading(String),
+    Count {
+        indent: usize,
+        label: String,
+        count: usize,
+        share: String,
+    },
+    Value {
+        indent: usize,
+        label: String,
+        value: String,
+    },
+}
+
+impl Row {
+    fn heading(title: &str) -> Row {
+        Row::Heading(title.to_string())
+    }
+
+    fn count(indent: usize, label: &str, count: usize, share: String) -> Row {
+        Row::Count {
+            indent,
+            label: label.to_string(),
+            count,
+            share,
+        }
+    }
+
+    fn value(label: &str, value: impl Into<String>) -> Row {
+        Row::Value {
+            indent: 2,
+            label: label.to_string(),
+            value: value.into(),
+        }
+    }
+
+    /// How wide this row's label is, indent included, or none for a heading.
+    fn label_width(&self) -> Option<usize> {
+        match self {
+            Row::Heading(_) => None,
+            Row::Count { indent, label, .. } | Row::Value { indent, label, .. } => {
+                Some(indent + label.len())
+            }
+        }
+    }
+}
+
+/// Lay out report rows so that every count lands in one column whatever its nesting
+/// depth, and every value starts in one column too.
+///
+/// The columns are measured from the rows actually being printed rather than fixed, so a
+/// run of a hundred reads and a run of ten million both come out square. Shares are
+/// right-aligned as well, which lines up the decimal point.
+fn render_rows(rows: &[Row]) -> String {
+    let width = |lengths: &mut dyn Iterator<Item = usize>| lengths.max().unwrap_or(0);
+    let label_width = width(&mut rows.iter().filter_map(Row::label_width));
+    let count_width = width(&mut rows.iter().filter_map(|row| match row {
+        Row::Count { count, .. } => Some(count.to_string().len()),
+        _ => None,
+    }));
+    let share_width = width(&mut rows.iter().filter_map(|row| match row {
+        Row::Count { share, .. } => Some(share.len()),
+        _ => None,
+    }));
+
+    let mut out = String::new();
+    for row in rows {
+        match row {
+            Row::Heading(title) => out.push_str(&format!("\n{title}\n")),
+            Row::Count {
+                indent,
+                label,
+                count,
+                share,
+            } => {
+                let label = format!("{}{label}", " ".repeat(*indent));
+                out.push_str(&format!("{label:<label_width$}  {count:>count_width$}"));
+                if !share.is_empty() {
+                    out.push_str(&format!("  {share:>share_width$}"));
+                }
+                out.push('\n');
+            }
+            Row::Value {
+                indent,
+                label,
+                value,
+            } => {
+                let label = format!("{}{label}", " ".repeat(*indent));
+                out.push_str(&format!("{label:<label_width$}  {value}\n"));
+            }
+        }
+    }
+    out
+}
+
+/// Everything the end-of-run report says about the run itself: what went in, how it was
+/// configured, when it ran and how fast. The read accounting comes from [`RunSummary`].
+///
+/// Written to stdout so it can be captured with `> run.txt` or piped into something that
+/// keeps it, separately from the warnings on stderr. The results go to their own file, so
+/// nothing is competing for stdout.
+struct RunReport {
+    started: SystemTime,
+    finished: SystemTime,
+    elapsed: Duration,
+    segments_file: String,
+    segments_loaded: usize,
+    sequences_file: String,
+    sequences_format: &'static str,
+    sequences_bytes: u64,
+    reads: usize,
+    bases: u64,
+    options: Vec<(String, String)>,
+}
+
+impl RunReport {
+    /// The whole report: the run, its inputs and options, the read accounting, and how
+    /// fast it went. Laid out by [`render_rows`], so every column lines up across the
+    /// sections rather than each being square only within itself.
+    fn render(&self, summary: &RunSummary) -> String {
+        let mut rows = vec![
+            Row::heading("Run"),
+            Row::value("started", format_utc(self.started)),
+            Row::value("finished", format_utc(self.finished)),
+            Row::value("elapsed", human_duration(self.elapsed)),
+            Row::heading("Input"),
+            Row::value("segments file", self.segments_file.clone()),
+            Row::count(2, "segments loaded", self.segments_loaded, String::new()),
+            Row::value("sequences file", self.sequences_file.clone()),
+            Row::value("sequences format", self.sequences_format),
+            Row::value("sequences size", human_bytes(self.sequences_bytes)),
+            Row::heading("Options"),
+        ];
+        rows.extend(
+            self.options
+                .iter()
+                .map(|(name, value)| Row::value(name, value.clone())),
+        );
+        rows.push(Row::heading("Summary"));
+        rows.extend(summary.rows());
+        rows.push(Row::heading("Throughput"));
+        rows.push(Row::value("bases read", human_bases(self.bases as f64)));
+        // A run so short that the clock cannot separate its ends has no meaningful rate
+        // to quote, and dividing by it would print an infinity.
+        let seconds = self.elapsed.as_secs_f64();
+        if seconds > 0.0 {
+            rows.push(Row::value(
+                "reads per second",
+                format!("{:.0}", self.reads as f64 / seconds),
+            ));
+            rows.push(Row::value(
+                "bases per second",
+                human_bases(self.bases as f64 / seconds),
+            ));
+        }
+        render_rows(&rows)
+    }
+}
+
 /// The auto-detected format of a sequences file.
 enum InputFormat {
     Fastq,
     FastqGz,
     Bam,
+}
+
+impl InputFormat {
+    /// What to call this format in the run report.
+    fn name(&self) -> &'static str {
+        match self {
+            InputFormat::Fastq => "FASTQ",
+            InputFormat::FastqGz => "gzipped FASTQ",
+            InputFormat::Bam => "unaligned BAM",
+        }
+    }
 }
 
 /// Inspect a file to determine whether it's FASTQ (starts with '@'), gzipped FASTQ, or BAM.
@@ -682,6 +926,9 @@ enum Source {
 /// reported once the whole file has been read.
 struct ReadStream {
     source: Source,
+    /// What `detect_format` decided when the file was opened, kept so the run report can
+    /// name it without re-reading the file - which by then might not even be there.
+    format: &'static str,
     filename: std::path::PathBuf,
     bytes_read: std::sync::Arc<std::sync::atomic::AtomicU64>,
     record: fastq::Record,
@@ -708,7 +955,8 @@ impl ReadStream {
                     bytes: bytes.clone(),
                 })
             };
-        let source = match detect_format(filename)? {
+        let format = detect_format(filename)?;
+        let source = match format {
             InputFormat::Fastq => {
                 let raw: Box<dyn Read> = Box::new(counted(&bytes_read)?);
                 Source::Fastq(fastq::Reader::new(raw))
@@ -731,6 +979,7 @@ impl ReadStream {
         };
         Ok(ReadStream {
             source,
+            format: format.name(),
             filename: filename.to_path_buf(),
             bytes_read,
             record: fastq::Record::new(),
@@ -1205,33 +1454,27 @@ fn classify_read_segments(
         .collect()
 }
 
-/// The segment string: the names in read order joined by `-`, bounded by the anchors only
-/// if the user supplied them.
-fn segment_string(found: &[FoundSegment], start_end_segs: bool) -> String {
-    let mut seg_names: Vec<&str> = Vec::new();
-    if start_end_segs {
-        seg_names.push("start");
-    }
-    seg_names.extend(found.iter().map(|segment| segment.name.as_str()));
-    if start_end_segs {
-        seg_names.push("end");
-    }
-    seg_names.join("-")
+/// The segment string: the names in read order joined by `-`.
+fn segment_string(found: &[FoundSegment]) -> String {
+    found
+        .iter()
+        .map(|segment| segment.name.as_str())
+        .collect::<Vec<_>>()
+        .join("-")
 }
 
-/// The same segments with the span each covers, as `seg1[1,13],seg2*[15,20]`.
+/// The same segments with the span each covers, as `seg1[1:13],seg2*[15:20]`.
+///
+/// Entries are separated by commas and the two positions within one by a colon, so the
+/// column can be split on `,` without the separators being confused for one another.
 ///
 /// Positions are 1-based and inclusive of both ends, counted along the extracted sequence
 /// written beside them rather than along the read as it arrived - with `--start-end-segs`
 /// the two differ, since the read has been trimmed and possibly reoriented by then.
-///
-/// The anchors are left out even though [`segment_string`] names them: they are the two
-/// ends of the extracted sequence by construction, so a span for them would say nothing
-/// that the sequence itself does not.
 fn located_segment_string(found: &[FoundSegment]) -> String {
     found
         .iter()
-        .map(|segment| format!("{}[{},{}]", segment.name, segment.start + 1, segment.end))
+        .map(|segment| format!("{}[{}:{}]", segment.name, segment.start + 1, segment.end))
         .collect::<Vec<_>>()
         .join(",")
 }
@@ -1242,17 +1485,42 @@ fn located_segment_string(found: &[FoundSegment]) -> String {
 /// were given, and the trimmed, reoriented span between them when they were. That is the
 /// sequence `--detailed-output` writes and the one the positions beside it are counted
 /// along, so the three columns always describe the same thing.
+///
+/// `anchor_spans` carries how much of `clean_seq` the 'start' and 'end' anchors take up,
+/// and is `None` when the read was classified without anchors. The extracted sequence
+/// runs from the first base of 'start' to the last base of 'end' whichever strand the
+/// read arrived on, so the anchors are always its two ends and their spans follow from
+/// their lengths alone.
 fn classified_read(
     read_name: String,
     clean_seq: &[u8],
     segments: &HashMap<String, Segment>,
-    start_end_segs: bool,
+    anchor_spans: Option<(usize, usize)>,
     detailed: bool,
 ) -> SegmentedRead {
-    let found = classify_read_segments(segments, clean_seq, start_end_segs);
+    let mut found = classify_read_segments(segments, clean_seq, anchor_spans.is_some());
+    if let Some((start_span, end_span)) = anchor_spans {
+        // Put back at their known positions rather than searched for: they were located
+        // once already, to trim the read to them.
+        found.insert(
+            0,
+            FoundSegment {
+                name: "start".to_string(),
+                start: 0,
+                end: start_span,
+            },
+        );
+        found.push(FoundSegment {
+            name: "end".to_string(),
+            // Saturating because a pathological read could align both anchors across
+            // more bases than lie between them; better a clamped span than a panic.
+            start: clean_seq.len().saturating_sub(end_span),
+            end: clean_seq.len(),
+        });
+    }
     SegmentedRead {
         name: read_name,
-        segments: segment_string(&found, start_end_segs),
+        segments: segment_string(&found),
         detail: detailed.then(|| ReadDetail {
             located: located_segment_string(&found),
             sequence: String::from_utf8_lossy(clean_seq).into_owned(),
@@ -1311,11 +1579,7 @@ fn process_reads(
                 // No anchors: classify the read as it arrived, on whichever strand.
                 let clean_seq = cut_reorient_seq(&read_seq, 0, read_seq.len(), false);
                 Outcome::Classified(classified_read(
-                    read_name,
-                    &clean_seq,
-                    segments,
-                    start_end_segs,
-                    detailed,
+                    read_name, &clean_seq, segments, None, detailed,
                 ))
             } else if let Some(anchors) = start_end_seqs.as_ref() {
                 let anchor = |seq: &[u8]| best_semiglobal(seq, &read_seq, ANCHOR_SCORING);
@@ -1353,7 +1617,10 @@ fn process_reads(
                             read_name,
                             &clean_seq,
                             segments,
-                            start_end_segs,
+                            Some((
+                                align_start.yend - align_start.ystart,
+                                align_end.yend - align_end.ystart,
+                            )),
                             detailed,
                         ))
                     } else {
@@ -1389,7 +1656,10 @@ fn process_reads(
                             read_name,
                             &clean_seq,
                             segments,
-                            start_end_segs,
+                            Some((
+                                align_start_rc.yend - align_start_rc.ystart,
+                                align_end_rc.yend - align_end_rc.ystart,
+                            )),
                             detailed,
                         ))
                     } else {
@@ -1607,6 +1877,10 @@ fn main() {
 /// Load the inputs, classify every read, write the results and report the summary.
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    // Both clocks: the wall clock for the timestamps a person reads, and a monotonic one
+    // for the elapsed time, which must not be thrown off by the clock being adjusted.
+    let started = SystemTime::now();
+    let start_instant = Instant::now();
 
     if !(0.0..=2.0).contains(&cli.min_norm_score) {
         return Err(format!(
@@ -1685,12 +1959,17 @@ fn run() -> Result<()> {
     let mut summary = RunSummary::default();
     let mut classifications = ClassificationCounts::default();
     let mut reads_seen = 0usize;
+    let mut bases_seen = 0u64;
     loop {
         let chunk = stream.next_chunk(MAX_CHUNK_BASES, MAX_CHUNK_READS)?;
         if chunk.is_empty() {
             break;
         }
         reads_seen += chunk.len();
+        bases_seen += chunk
+            .iter()
+            .map(|record| record.seq.len() as u64)
+            .sum::<u64>();
         let (clean_seqs, chunk_summary) = process_reads(
             chunk,
             &segments,
@@ -1748,6 +2027,45 @@ fn run() -> Result<()> {
         ));
     }
     summary.unreadable = stream.skipped;
-    eprint!("{}", summary.render());
+
+    let on_off = |enabled: bool| if enabled { "on" } else { "off" }.to_string();
+    let report = RunReport {
+        started,
+        finished: SystemTime::now(),
+        elapsed: start_instant.elapsed(),
+        segments_file: cli.segments.clone(),
+        segments_loaded: segments.len(),
+        sequences_file: cli.sequences.clone(),
+        sequences_format: stream.format,
+        sequences_bytes: total_bytes,
+        reads: reads_seen,
+        bases: bases_seen,
+        // Every option at the value it actually ran with, so the report is a record of
+        // what produced the results beside it and not just of how they turned out.
+        options: vec![
+            (
+                "--min-norm-score".to_string(),
+                cli.min_norm_score.to_string(),
+            ),
+            (
+                "--per-segment-scores".to_string(),
+                on_off(cli.per_segment_scores),
+            ),
+            ("--start-end-segs".to_string(), on_off(cli.start_end_segs)),
+            ("--circular".to_string(), on_off(cli.circular)),
+            ("--min-seq-len".to_string(), cli.min_seq_len.to_string()),
+            ("--max-seq-len".to_string(), cli.max_seq_len.to_string()),
+            ("--threads".to_string(), cli.threads.to_string()),
+            ("--detailed-output".to_string(), on_off(cli.detailed_output)),
+            ("--classifications".to_string(), cli.classifications.clone()),
+            (
+                "--counts".to_string(),
+                cli.counts
+                    .clone()
+                    .unwrap_or_else(|| "(not written)".to_string()),
+            ),
+        ],
+    };
+    print!("{}", report.render(&summary));
     Ok(())
 }

@@ -131,10 +131,11 @@ fn cli_default_score_threshold_is_documented_value() {
     );
 }
 
-/// The summary is written to stderr, never to stdout or the results file, so it cannot
-/// contaminate a downstream pipeline reading either.
+/// The run report goes to stdout, warnings to stderr, and results to their own file, so
+/// each can be captured separately. Nothing competes for stdout: the results never go
+/// there, so `> run.txt` keeps the report and nothing else.
 #[test]
-fn cli_writes_summary_to_stderr_only() {
+fn cli_writes_the_run_report_to_stdout_and_warnings_to_stderr() {
     let dir = TempDir::new().unwrap();
     let refs = dir.path().join("refs.fasta");
     fs::write(
@@ -151,6 +152,13 @@ fn cli_writes_summary_to_stderr_only() {
             ("no_anchors", &format!("{JUNK}{SEG_A}{JUNK}")),
         ],
     );
+    // A record with no sequence, to produce a warning alongside the report.
+    let mut f = fs::OpenOptions::new()
+        .append(true)
+        .open(&sequences)
+        .unwrap();
+    writeln!(f, "@empty\n\n+\n").unwrap();
+    drop(f);
 
     let output = dir.path().join("out.txt");
     let result = Command::new(env!("CARGO_BIN_EXE_segment"))
@@ -163,22 +171,28 @@ fn cli_writes_summary_to_stderr_only() {
         .unwrap();
     assert!(result.status.success());
 
+    let stdout = String::from_utf8(result.stdout).unwrap();
     let stderr = String::from_utf8(result.stderr).unwrap();
+
+    assert!(stdout.contains("Summary"), "no report on stdout:\n{stdout}");
+    assert!(stdout.contains("classified:"), "{stdout}");
     assert!(
-        stderr.contains("Summary"),
-        "no summary on stderr:\n{stderr}"
-    );
-    assert!(stderr.contains("classified:"), "{stderr}");
-    assert!(
-        stderr.contains("neither segment found"),
-        "the unanchored read should be reported as a rejection:\n{stderr}"
+        stdout.contains("neither segment found"),
+        "the unanchored read should be reported as a rejection:\n{stdout}"
     );
 
+    // Warnings stay on stderr: they are diagnostics about individual records, not part
+    // of the report, and mixing them into it would corrupt a captured report.
     assert!(
-        String::from_utf8(result.stdout).unwrap().is_empty(),
-        "stdout must stay clean"
+        stderr.contains("warning:") && stderr.contains("empty"),
+        "the unusable record should be warned about on stderr:\n{stderr}"
     );
-    // The results file holds only the classified read, with no summary text in it.
+    assert!(
+        !stderr.contains("Summary"),
+        "the report should not be duplicated on stderr:\n{stderr}"
+    );
+
+    // The results file holds only the classified read, with no report text in it.
     assert_eq!(fs::read_to_string(&output).unwrap(), "good\tstart-A-end\n");
 }
 
@@ -293,6 +307,72 @@ fn cli_rejects_an_unreadable_per_segment_score() {
     );
 }
 
+/// The report records what the run was given and how it was configured, so a captured
+/// report says what produced the results beside it rather than only how they turned out.
+#[test]
+fn cli_report_records_the_inputs_and_the_options_it_ran_with() {
+    let dir = TempDir::new().unwrap();
+    let refs = dir.path().join("refs.fasta");
+    fs::write(
+        &refs,
+        format!(">start\n{START}\n>end\n{END}\n>A\n{SEG_A}\n"),
+    )
+    .unwrap();
+    let sequences = dir.path().join("reads.fastq");
+    write_fastq(
+        &sequences,
+        &[("read", &format!("{JUNK}{START}{SEG_A}{END}{JUNK}"))],
+    );
+
+    let output = dir.path().join("out.txt");
+    let result = Command::new(env!("CARGO_BIN_EXE_segment"))
+        .args(["--segments", refs.to_str().unwrap()])
+        .args(["--sequences", sequences.to_str().unwrap()])
+        .args(["--classifications", output.to_str().unwrap()])
+        .args(["--min-seq-len", "0", "--max-seq-len", "12345"])
+        .args(["--min-norm-score", "1.7", "--start-end-segs", "--circular"])
+        .output()
+        .unwrap();
+    assert!(result.status.success());
+    let report = String::from_utf8(result.stdout).unwrap();
+
+    // The files that went in, named and measured.
+    assert!(report.contains(refs.to_str().unwrap()), "{report}");
+    assert!(report.contains(sequences.to_str().unwrap()), "{report}");
+    assert!(report.contains("segments loaded"), "{report}");
+    assert!(report.contains("FASTQ"), "the detected format:\n{report}");
+
+    // The options at the values actually used, not their defaults.
+    for expected in [
+        "--min-norm-score",
+        "1.7",
+        "--max-seq-len",
+        "12345",
+        "--start-end-segs",
+        "--circular",
+    ] {
+        assert!(report.contains(expected), "missing {expected}:\n{report}");
+    }
+    // Flags that were not given are shown as off rather than omitted, so the report says
+    // what every option was, not only the ones that were typed.
+    assert!(report.contains("--detailed-output"), "{report}");
+    assert!(report.contains("off"), "{report}");
+    assert!(
+        report.contains("(not written)"),
+        "--counts was not given:\n{report}"
+    );
+
+    // When it ran and how fast.
+    assert!(
+        report.contains("started") && report.contains("finished"),
+        "{report}"
+    );
+    assert!(report.contains("UTC"), "timestamps are labelled:\n{report}");
+    assert!(report.contains("elapsed"), "{report}");
+    assert!(report.contains("reads per second"), "{report}");
+    assert!(report.contains("bases read"), "{report}");
+}
+
 /// --detailed-output adds two columns to the classifications file: where each segment
 /// sits in the extracted sequence, and that sequence itself. The per-read classification
 /// is unchanged by it, so the flag adds columns rather than altering the existing ones.
@@ -329,9 +409,10 @@ fn cli_detailed_output_adds_positions_and_the_extracted_sequence() {
     );
     let report = fs::read_to_string(&detailed).unwrap();
 
-    // START is 20 bp, so A runs 21..40 and B 41..60 along the trimmed construct. Both
-    // reads describe it identically, the reverse one having been reoriented first.
-    let expected = format!("start-A-B-end\tA[21,40],B[41,60]\t{construct}");
+    // START is 20 bp, so A runs 21..40 and B 41..60 along the trimmed construct, with the
+    // anchors bounding it at either end. Both reads describe it identically, the reverse
+    // one having been reoriented first.
+    let expected = format!("start-A-B-end\tstart[1:20],A[21:40],B[41:60],end[61:80]\t{construct}");
     assert_eq!(
         report,
         format!("fwd\t{expected}\nrev\t{expected}\n"),
