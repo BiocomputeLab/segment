@@ -2370,3 +2370,130 @@ fn byte_progress_tracks_the_file_for_every_format() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Summary layout
+// ---------------------------------------------------------------------------
+
+/// A summary line with its trailing percentage removed, so what is left ends with the
+/// count. Used by the alignment tests below to find where each column sits.
+fn without_percentage(line: &str) -> &str {
+    match line.rfind('(') {
+        Some(open) if line.ends_with("%)") => line[..open].trim_end(),
+        _ => line.trim_end(),
+    }
+}
+
+/// The summary lines that carry a count, i.e. everything but the heading.
+fn counted_lines(report: &str) -> Vec<&str> {
+    report
+        .lines()
+        .filter(|line| line.starts_with(' '))
+        .collect()
+}
+
+/// Every count ends in the same column whatever its nesting depth. The indented
+/// breakdown rows used to be laid out to their own hardcoded width, which put them
+/// nineteen columns to the right of the totals they were breaking down.
+#[test]
+fn every_count_ends_in_the_same_column() {
+    let report = RunSummary {
+        classified: 8,
+        too_short: 2,
+        anchors_out_of_order: 250,
+        unreadable: 9,
+        ..Default::default()
+    }
+    .render();
+    let columns: Vec<usize> = counted_lines(&report)
+        .iter()
+        .map(|line| without_percentage(line).len())
+        .collect();
+    assert_eq!(columns.len(), 6, "expected every row to count:\n{report}");
+    assert!(
+        columns.iter().all(|column| *column == columns[0]),
+        "counts do not share a column:\n{report}"
+    );
+}
+
+/// Percentages are right-aligned as well, so the decimal point and the closing bracket
+/// line up whether the figure is 0.0% or 100.0% - two characters wider.
+#[test]
+fn every_percentage_ends_in_the_same_column() {
+    let report = RunSummary {
+        classified: 20,
+        ..Default::default()
+    }
+    .render();
+    assert!(report.contains("(100.0%)"), "{report}");
+    assert!(report.contains("(0.0%)"), "{report}");
+    let ends: Vec<usize> = report
+        .lines()
+        .filter(|line| line.ends_with("%)"))
+        .map(str::len)
+        .collect();
+    assert_eq!(ends.len(), 2, "both shares are quoted:\n{report}");
+    assert_eq!(
+        ends[0], ends[1],
+        "percentages do not share a column:\n{report}"
+    );
+}
+
+/// The columns are measured from the rows being printed rather than fixed, so a small
+/// run is not padded out to the width of a large one, and a large one is not squeezed.
+#[test]
+fn columns_are_sized_to_the_numbers_they_hold() {
+    let column_of = |classified: usize| {
+        let report = RunSummary {
+            classified,
+            ..Default::default()
+        }
+        .render();
+        without_percentage(counted_lines(&report)[0]).len()
+    };
+    assert!(
+        column_of(7_000_000) > column_of(7),
+        "the column should grow with the numbers in it"
+    );
+    let large = RunSummary {
+        classified: 7_000_000,
+        ..Default::default()
+    }
+    .render();
+    assert!(large.contains("7000000"), "nothing is truncated:\n{large}");
+}
+
+/// However long the label, there is always a gap before its count. The widest row is the
+/// one that sets the column, and it is the one at risk of the two running together.
+#[test]
+fn no_label_runs_into_its_count() {
+    let report = RunSummary {
+        classified: 1,
+        anchors_on_opposite_strands: 1,
+        unreadable: 1,
+        ..Default::default()
+    }
+    .render();
+    for line in counted_lines(&report) {
+        let upto_count = without_percentage(line);
+        let count_start = upto_count.rfind(' ').map_or(0, |space| space + 1);
+        assert!(
+            upto_count[..count_start].ends_with("  "),
+            "label runs into its count: {line:?}"
+        );
+    }
+}
+
+/// With no reads there is no share to quote, so the percentage column disappears rather
+/// than dividing by zero, and what is left still lines up.
+#[test]
+fn a_summary_of_no_reads_has_no_percentage_column() {
+    let report = RunSummary::default().render();
+    assert!(!report.contains('%'), "no percentages to show:\n{report}");
+    assert!(!report.contains("NaN"), "{report}");
+    let columns: Vec<usize> = counted_lines(&report).iter().map(|l| l.len()).collect();
+    assert!(
+        columns.iter().all(|column| *column == columns[0]),
+        "counts do not share a column:\n{report}"
+    );
+}

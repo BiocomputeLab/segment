@@ -369,19 +369,28 @@ At the end of every run a summary is written to stderr, accounting for every rea
 
 ```
 Summary
-  reads read:             10
-  classified:              4  (40.0%)
-  not classified:          6  (60.0%)
-    read too short                            1
-    'start' segment not found                 1
-    'end' segment not found                   1
-    neither segment found                     1
-    'start'/'end' on opposite strands         1
-    'start'/'end' out of order                1
-  records skipped while reading the input: 1
+  reads read:                               10
+  classified:                                4  (40.0%)
+  not classified:                            6  (60.0%)
+    read too short                           1
+    'start' segment not found                1
+    'end' segment not found                  1
+    neither segment found                    1
+    'start'/'end' on opposite strands        1
+    'start'/'end' out of order               1
+  records skipped while reading the input:   1
 ```
 
 Classified and not-classified always add back up to the number of reads, and each rejected read is counted under exactly one reason. Categories that did not occur are left out, so a run with no anchoring shows only the length rejections.
+
+Every count shares one column whatever its nesting depth, and the columns are measured from the rows actually being printed, so a run of a hundred reads and a run of ten million both come out square:
+
+```
+Summary
+  reads read:      100
+  classified:      100  (100.0%)
+  not classified:    0    (0.0%)
+```
 
 | Reason | Meaning |
 |---|---|

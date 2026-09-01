@@ -457,26 +457,34 @@ impl RunSummary {
     /// Render the end-of-run summary. Categories that cannot arise for the given
     /// settings - the anchor ones without --start-end-segs, for instance - stay at zero
     /// and are left out, so the report only shows what actually happened.
+    ///
+    /// Every count lands in one column whatever its nesting depth, and the columns are
+    /// measured from the rows actually being printed rather than fixed, so a run of a
+    /// hundred reads and a run of ten million both come out square. Percentages are
+    /// right-aligned too, which lines up the decimal point.
     fn render(&self) -> String {
-        let pct = |n: usize| {
+        // Blank unless there are reads to be a share of, which also drops the column.
+        let pct = |n: usize| -> String {
             if self.reads() == 0 {
                 String::new()
             } else {
-                format!("  ({:.1}%)", 100.0 * n as f64 / self.reads() as f64)
+                format!("({:.1}%)", 100.0 * n as f64 / self.reads() as f64)
             }
         };
-        let mut out = String::from("\nSummary\n");
-        out.push_str(&format!("  reads read:      {:>9}\n", self.reads()));
-        out.push_str(&format!(
-            "  classified:      {:>9}{}\n",
-            self.classified,
-            pct(self.classified)
-        ));
-        out.push_str(&format!(
-            "  not classified:  {:>9}{}\n",
-            self.not_classified(),
-            pct(self.not_classified())
-        ));
+
+        // Indent, label, count, and the share of all reads where one is meaningful. The
+        // breakdown rows are shares of the reads that were not classified rather than of
+        // every read, so quoting them against the same total would mislead.
+        let mut rows: Vec<(usize, &str, usize, String)> = vec![
+            (2, "reads read:", self.reads(), String::new()),
+            (2, "classified:", self.classified, pct(self.classified)),
+            (
+                2,
+                "not classified:",
+                self.not_classified(),
+                pct(self.not_classified()),
+            ),
+        ];
         for (label, count) in [
             ("read too short", self.too_short),
             ("read too long", self.too_long),
@@ -490,14 +498,32 @@ impl RunSummary {
             ("'start'/'end' out of order", self.anchors_out_of_order),
         ] {
             if count > 0 {
-                out.push_str(&format!("    {label:<36}{count:>7}\n"));
+                rows.push((4, label, count, String::new()));
             }
         }
+        // Records that never became reads at all, so outside the accounting above.
         if self.unreadable > 0 {
-            out.push_str(&format!(
-                "  records skipped while reading the input: {}\n",
-                self.unreadable
+            rows.push((
+                2,
+                "records skipped while reading the input:",
+                self.unreadable,
+                String::new(),
             ));
+        }
+
+        let width = |lengths: &mut dyn Iterator<Item = usize>| lengths.max().unwrap_or(0);
+        let label_width = width(&mut rows.iter().map(|(indent, label, ..)| indent + label.len()));
+        let count_width = width(&mut rows.iter().map(|(_, _, count, _)| count.to_string().len()));
+        let pct_width = width(&mut rows.iter().map(|(.., pct)| pct.len()));
+
+        let mut out = String::from("\nSummary\n");
+        for (indent, label, count, pct) in &rows {
+            let label = format!("{}{label}", " ".repeat(*indent));
+            out.push_str(&format!("{label:<label_width$}  {count:>count_width$}"));
+            if !pct.is_empty() {
+                out.push_str(&format!("  {pct:>pct_width$}"));
+            }
+            out.push('\n');
         }
         out
     }
