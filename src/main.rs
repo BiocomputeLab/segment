@@ -1440,12 +1440,20 @@ struct FoundSegment {
 /// bounds. Without it the read is classified as given and a segment named 'start' or
 /// 'end' is treated like any other.
 ///
+/// With `omit_rc_segs` each segment is looked for on the forward strand only, so no hit
+/// can ever be reported under a starred name. That is the caller asserting the strand
+/// every segment sits on is already known - which anchoring establishes, since the read
+/// has been reoriented by then - and it halves the alignment work. Without it both
+/// strands are searched, which is the default and what to keep when the orientation of a
+/// segment within the construct is not known in advance.
+///
 /// Each segment is found at its own threshold, resolved when the segments file was
 /// loaded, so there is no global score to apply here.
 fn classify_read_segments(
     segments: &HashMap<String, Segment>,
     read_seq: &[u8],
     start_end_segs: bool,
+    omit_rc_segs: bool,
 ) -> Vec<FoundSegment> {
     let aligner = MultiTracebackAligner::new(
         2,  // match score
@@ -1465,12 +1473,14 @@ fn classify_read_segments(
         }
         let min_score = (seg_seq.len() as f32 * segment.min_norm_score) as i32;
         all_alignments.append(&mut aligner.align_multiple(seg_name, seg_seq, read_seq, min_score));
-        all_alignments.append(&mut aligner.align_multiple(
-            &format!("{}*", seg_name),
-            &dna::revcomp(seg_seq),
-            read_seq,
-            min_score,
-        ));
+        if !omit_rc_segs {
+            all_alignments.append(&mut aligner.align_multiple(
+                &format!("{}*", seg_name),
+                &dna::revcomp(seg_seq),
+                read_seq,
+                min_score,
+            ));
+        }
     }
     // Highest normalised score first; total_cmp orders every float, so a stray NaN can
     // never panic here. Position and name break ties: segments live in a HashMap whose
@@ -1573,9 +1583,11 @@ fn classified_read(
     clean_seq: &[u8],
     segments: &HashMap<String, Segment>,
     anchor_spans: Option<(usize, usize)>,
+    omit_rc_segs: bool,
     detailed: bool,
 ) -> SegmentedRead {
-    let mut found = classify_read_segments(segments, clean_seq, anchor_spans.is_some());
+    let mut found =
+        classify_read_segments(segments, clean_seq, anchor_spans.is_some(), omit_rc_segs);
     if let Some((start_span, end_span)) = anchor_spans {
         // Put back at their known positions rather than searched for: they were located
         // once already, to trim the read to them.
@@ -1613,6 +1625,7 @@ fn process_reads(
     len_check: (usize, usize),
     circular: bool,
     start_end_segs: bool,
+    omit_rc_segs: bool,
     detailed: bool,
 ) -> Result<(Vec<SegmentedRead>, RunSummary)> {
     // Precompute start/end revcomps and score minimums once rather than per-read
@@ -1659,7 +1672,12 @@ fn process_reads(
                 // No anchors: classify the read as it arrived, on whichever strand.
                 let clean_seq = cut_reorient_seq(&read_seq, 0, read_seq.len(), false);
                 Outcome::Classified(classified_read(
-                    read_name, &clean_seq, segments, None, detailed,
+                    read_name,
+                    &clean_seq,
+                    segments,
+                    None,
+                    omit_rc_segs,
+                    detailed,
                 ))
             } else if let Some(anchors) = start_end_seqs.as_ref() {
                 let anchor = |seq: &[u8]| best_semiglobal(seq, &read_seq, ANCHOR_SCORING);
@@ -1701,6 +1719,7 @@ fn process_reads(
                                 align_start.yend - align_start.ystart,
                                 align_end.yend - align_end.ystart,
                             )),
+                            omit_rc_segs,
                             detailed,
                         ))
                     } else {
@@ -1740,6 +1759,7 @@ fn process_reads(
                                 align_start_rc.yend - align_start_rc.ystart,
                                 align_end_rc.yend - align_end_rc.ystart,
                             )),
+                            omit_rc_segs,
                             detailed,
                         ))
                     } else {
@@ -1924,6 +1944,14 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     per_segment_scores: bool,
 
+    /// Look for each segment on the forward strand only, so nothing is reported under a
+    /// starred name. Use it when every segment's orientation within the construct is
+    /// already known - anchoring with --start-end-segs establishes it - to halve the
+    /// alignment work. Read orientation is unaffected: anchors are still matched on both
+    /// strands and reversed reads still recovered
+    #[arg(long, default_value_t = false)]
+    omit_rc_segs: bool,
+
     /// Sequences to classify are circular (i.e., from plasmids)
     #[arg(short = 'c', long, default_value_t = false)]
     circular: bool,
@@ -2059,6 +2087,7 @@ fn run() -> Result<()> {
             (cli.min_seq_len, cli.max_seq_len),
             cli.circular,
             cli.start_end_segs,
+            cli.omit_rc_segs,
             cli.detailed_output,
         )?;
         for r in clean_seqs {
@@ -2135,6 +2164,7 @@ fn run() -> Result<()> {
                 on_off(cli.per_segment_scores),
             ),
             ("--start-end-segs".to_string(), on_off(cli.start_end_segs)),
+            ("--omit-rc-segs".to_string(), on_off(cli.omit_rc_segs)),
             ("--circular".to_string(), on_off(cli.circular)),
             ("--min-seq-len".to_string(), cli.min_seq_len.to_string()),
             ("--max-seq-len".to_string(), cli.max_seq_len.to_string()),

@@ -431,6 +431,7 @@ fn cli_report_records_the_inputs_and_the_options_it_ran_with() {
     // Flags that were not given are shown as off rather than omitted, so the report says
     // what every option was, not only the ones that were typed.
     assert!(report.contains("--detailed-output"), "{report}");
+    assert!(report.contains("--omit-rc-segs"), "{report}");
     assert!(report.contains("off"), "{report}");
     assert!(
         report.contains("(not written)"),
@@ -779,5 +780,114 @@ fn cli_circular_flag_recovers_reads_that_wrap_the_origin() {
     assert_eq!(
         fs::read_to_string(&circular).unwrap(),
         "wrapped\tstart-A-end\n"
+    );
+}
+
+/// --omit-rc-segs looks for every segment on the forward strand only. On a read carrying
+/// A forwards and B backwards between the anchors, the default run finds both and stars
+/// B, while the flagged run reports only A - and says so in the report it prints.
+#[test]
+fn cli_omit_rc_segs_reports_only_forward_strand_segments() {
+    let dir = TempDir::new().unwrap();
+    let refs = dir.path().join("refs.fasta");
+    fs::write(
+        &refs,
+        format!(">start\n{START}\n>end\n{END}\n>A\n{SEG_A}\n>B\n{SEG_B}\n"),
+    )
+    .unwrap();
+
+    let sequences = dir.path().join("reads.fastq");
+    let read = format!("{JUNK}{START}{SEG_A}{}{END}{JUNK}", rc(SEG_B));
+    write_fastq(&sequences, &[("read", &read)]);
+
+    let both_strands = dir.path().join("both.txt");
+    run_segment(&refs, &sequences, &both_strands, &["--start-end-segs"]);
+    assert_eq!(
+        fs::read_to_string(&both_strands).unwrap(),
+        "read\tstart-A-B*-end\n"
+    );
+
+    let forward_only = dir.path().join("forward.txt");
+    let result = Command::new(env!("CARGO_BIN_EXE_segment"))
+        .args(["--segments", refs.to_str().unwrap()])
+        .args(["--sequences", sequences.to_str().unwrap()])
+        .args(["--classifications", forward_only.to_str().unwrap()])
+        .args(["--start-end-segs", "--omit-rc-segs"])
+        .output()
+        .unwrap();
+    assert!(result.status.success());
+    assert_eq!(
+        fs::read_to_string(&forward_only).unwrap(),
+        "read\tstart-A-end\n"
+    );
+    let report = String::from_utf8(result.stdout).unwrap();
+    assert!(report.contains("--omit-rc-segs"), "{report}");
+    assert!(
+        report
+            .lines()
+            .any(|l| l.contains("--omit-rc-segs") && l.contains("on")),
+        "the flag should be recorded as on:\n{report}"
+    );
+}
+
+/// The flag is off by default, so a run that does not pass it still finds reverse-strand
+/// segments exactly as it always has, and its report says the flag was off.
+#[test]
+fn cli_reverse_strand_segments_are_found_by_default() {
+    let dir = TempDir::new().unwrap();
+    let refs = dir.path().join("refs.fasta");
+    fs::write(&refs, format!(">A\n{SEG_A}\n>B\n{SEG_B}\n")).unwrap();
+
+    let sequences = dir.path().join("reads.fastq");
+    write_fastq(
+        &sequences,
+        &[("read", &format!("{JUNK}{SEG_A}{JUNK}{}{JUNK}", rc(SEG_B)))],
+    );
+
+    let output = dir.path().join("out.txt");
+    let result = Command::new(env!("CARGO_BIN_EXE_segment"))
+        .args(["--segments", refs.to_str().unwrap()])
+        .args(["--sequences", sequences.to_str().unwrap()])
+        .args(["--classifications", output.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(result.status.success());
+    assert_eq!(fs::read_to_string(&output).unwrap(), "read\tA-B*\n");
+    let report = String::from_utf8(result.stdout).unwrap();
+    assert!(
+        report
+            .lines()
+            .any(|l| l.contains("--omit-rc-segs") && l.contains("off")),
+        "the flag should be recorded as off:\n{report}"
+    );
+}
+
+/// The flag hides reverse-strand segments; it does not stop reads being oriented. Two
+/// reads describing the same forward-strand construct on opposite strands must still
+/// give the identical segment string under --start-end-segs with the flag on.
+#[test]
+fn cli_omit_rc_segs_still_orients_reads_by_their_anchors() {
+    let dir = TempDir::new().unwrap();
+    let refs = dir.path().join("refs.fasta");
+    fs::write(
+        &refs,
+        format!(">start\n{START}\n>end\n{END}\n>A\n{SEG_A}\n"),
+    )
+    .unwrap();
+
+    let construct = format!("{JUNK}{START}{SEG_A}{END}{JUNK}");
+    let sequences = dir.path().join("reads.fastq");
+    write_fastq(&sequences, &[("fwd", &construct), ("rev", &rc(&construct))]);
+
+    let output = dir.path().join("out.txt");
+    run_segment(
+        &refs,
+        &sequences,
+        &output,
+        &["--start-end-segs", "--omit-rc-segs"],
+    );
+    assert_eq!(
+        fs::read_to_string(&output).unwrap(),
+        "fwd\tstart-A-end\nrev\tstart-A-end\n"
     );
 }

@@ -97,6 +97,18 @@ fn classify(segments: &[(&str, &str)], read: &str) -> String {
         &seg_map(segments),
         read.as_bytes(),
         false,
+        false,
+    ))
+}
+
+/// The same with --omit-rc-segs on, so segments are looked for on the forward strand
+/// only and no name can come back starred.
+fn classify_omitting_rc(segments: &[(&str, &str)], read: &str) -> String {
+    segment_string(&classify_read_segments(
+        &seg_map(segments),
+        read.as_bytes(),
+        false,
+        true,
     ))
 }
 
@@ -110,6 +122,7 @@ fn classify_anchored(segments: &[(&str, &str)], read: &str) -> String {
         read.as_bytes(),
         &seg_map(segments),
         Some((0, 0)),
+        false,
         false,
     )
     .segments
@@ -172,6 +185,32 @@ fn run(
         circular,
         start_end_segs,
         false,
+        false,
+    )
+    .unwrap()
+    .0
+    .into_iter()
+    .map(|r| (r.name, r.segments))
+    .collect()
+}
+
+/// The same with --omit-rc-segs on, so the pipeline looks for every segment on the
+/// forward strand only. Read orientation is untouched by the flag, so anchored runs
+/// still reverse a read that arrived off the opposite strand.
+fn run_omitting_rc(
+    reads: Vec<RawRead>,
+    segments: &[(&str, &str)],
+    circular: bool,
+    start_end_segs: bool,
+) -> Vec<(String, String)> {
+    process_reads(
+        reads,
+        &seg_map(segments),
+        (0, 0),
+        circular,
+        start_end_segs,
+        true,
+        false,
     )
     .unwrap()
     .0
@@ -194,6 +233,7 @@ fn run_detailed(
         (0, 0),
         circular,
         start_end_segs,
+        false,
         true,
     )
     .unwrap();
@@ -547,7 +587,8 @@ fn lowercase_segments_and_reads_are_handled() {
     let loaded = load_reads(&reads).unwrap().reads;
     assert_eq!(as_pairs(&loaded), vec![("r".to_string(), read.clone())]);
 
-    let (classified, _) = process_reads(loaded, &segments, (0, 0), false, false, false).unwrap();
+    let (classified, _) =
+        process_reads(loaded, &segments, (0, 0), false, false, false, false).unwrap();
     assert_eq!(classified[0].segments, "A-B");
 }
 
@@ -635,7 +676,7 @@ fn malformed_fastq_records_are_skipped_not_fatal() {
 fn missing_anchor_segments_are_reported_clearly() {
     let segments = seg_map(&[("A", SEG_A)]);
     let reads = vec![raw("r", &construct())];
-    let result = process_reads(reads, &segments, (0, 0), false, true, false);
+    let result = process_reads(reads, &segments, (0, 0), false, true, false, false);
     assert_error(result, "no segment named 'start'");
 }
 
@@ -1064,6 +1105,7 @@ fn a_bracketed_score_decides_whether_a_segment_is_found() {
             &seg_map_scored(&[("A", SEG_A, min_norm_score)]),
             read.as_bytes(),
             false,
+            false,
         ))
     };
     assert_eq!(classify_at(1.8), "A", "37/20 = 1.85 clears 1.8");
@@ -1084,7 +1126,12 @@ fn each_segment_is_found_at_its_own_threshold() {
     );
     let segments = seg_map_scored(&[("strict", SEG_A, 1.9), ("lenient", SEG_B, 1.8)]);
     assert_eq!(
-        segment_string(&classify_read_segments(&segments, read.as_bytes(), false)),
+        segment_string(&classify_read_segments(
+            &segments,
+            read.as_bytes(),
+            false,
+            false
+        )),
         "lenient"
     );
 }
@@ -1114,6 +1161,7 @@ fn a_bracketed_score_applies_to_the_anchors() {
             (0, 0),
             false,
             true,
+            false,
             false,
         )
         .unwrap()
@@ -1704,6 +1752,153 @@ fn unanchored_reverse_reads_are_not_reoriented() {
 }
 
 // ---------------------------------------------------------------------------
+// Forward-strand-only classification (--omit-rc-segs)
+// ---------------------------------------------------------------------------
+
+/// The flag drops exactly the reverse-strand hits and nothing else. The same read
+/// carries A forwards and B backwards: by default both are found and B is starred,
+/// while with the flag only the forward A survives.
+#[test]
+fn omit_rc_segs_drops_reverse_strand_hits() {
+    let segments = [("A", SEG_A), ("B", SEG_B)];
+    let read = format!("{}{}{}", SEG_A, SPACER, rc(SEG_B));
+    assert_eq!(classify(&segments, &read), "A-B*");
+    assert_eq!(classify_omitting_rc(&segments, &read), "A");
+}
+
+/// Forward hits are untouched by the flag, so a read whose segments all sit on the
+/// forward strand classifies identically with it and without it - including their
+/// order, which is positional either way.
+#[test]
+fn omit_rc_segs_leaves_forward_hits_untouched() {
+    let segments = [("A", SEG_A), ("B", SEG_B)];
+    let read = format!("{}{}{}", SEG_B, SPACER, SEG_A);
+    assert_eq!(classify(&segments, &read), "B-A");
+    assert_eq!(classify_omitting_rc(&segments, &read), "B-A");
+}
+
+/// No hit can be reported under a starred name, so a read that is entirely reverse
+/// strand and unanchored classifies as nothing at all rather than being read backwards.
+/// Contrast `unanchored_reverse_reads_are_not_reoriented`, which is the same read
+/// without the flag.
+#[test]
+fn omit_rc_segs_never_reports_a_starred_name() {
+    let segments = [("A", SEG_A), ("B", SEG_B)];
+    let read = rc(&format!("{}{}{}{}", JUNK_5, SEG_A, SPACER, SEG_B));
+    assert_eq!(
+        run(vec![raw("r", &read)], &segments, false, false),
+        expect("r", "B*-A*")
+    );
+    assert_eq!(
+        run_omitting_rc(vec![raw("r", &read)], &segments, false, false),
+        expect("r", "")
+    );
+}
+
+/// A segment that is its own reverse complement is found either way, since the two
+/// strands are the same sequence. The flag therefore changes nothing for it - not even
+/// the name, which is unstarred with the flag off too because the forward hit wins the
+/// tie against the identical starred one.
+#[test]
+fn omit_rc_segs_makes_no_difference_to_a_palindromic_segment() {
+    // Ten bases followed by their own reverse complement.
+    const PALINDROME: &str = "CGATGCTAGCGCTAGCATCG";
+    assert_eq!(
+        rc(PALINDROME),
+        PALINDROME,
+        "the fixture must be a palindrome"
+    );
+    let read = format!("{}{}{}", SPACER, PALINDROME, SPACER);
+    assert_eq!(classify(&[("P", PALINDROME)], &read), "P");
+    assert_eq!(classify_omitting_rc(&[("P", PALINDROME)], &read), "P");
+}
+
+/// The flag is about segments, not reads: anchors are still matched on both strands, so
+/// a read sequenced off the opposite strand is still flipped back into construct
+/// orientation and classifies exactly as its forward twin does. Without that, this read
+/// would classify as nothing.
+#[test]
+fn omit_rc_segs_still_reorients_anchored_reads() {
+    let forward = format!("{}{}{}", JUNK_5, construct(), JUNK_3);
+    assert_eq!(
+        run_omitting_rc(vec![raw("r", &forward)], &anchored_segments(), false, true),
+        expect("r", "start-A-B-end")
+    );
+    assert_eq!(
+        run_omitting_rc(
+            vec![raw("r", &rc(&forward))],
+            &anchored_segments(),
+            false,
+            true
+        ),
+        expect("r", "start-A-B-end")
+    );
+}
+
+/// Once a read has been anchored and oriented, a segment genuinely inverted within the
+/// construct is the one thing the flag hides. B sits backwards between the anchors here:
+/// by default it is found and starred, with the flag it is not found at all.
+#[test]
+fn omit_rc_segs_hides_a_segment_inverted_within_an_anchored_read() {
+    let read = format!(
+        "{}{}{}{}{}{}{}",
+        JUNK_5,
+        START,
+        SEG_A,
+        SPACER,
+        rc(SEG_B),
+        END,
+        JUNK_3
+    );
+    assert_eq!(
+        run(vec![raw("r", &read)], &anchored_segments(), false, true),
+        expect("r", "start-A-B*-end")
+    );
+    assert_eq!(
+        run_omitting_rc(vec![raw("r", &read)], &anchored_segments(), false, true),
+        expect("r", "start-A-end")
+    );
+}
+
+/// The detailed columns follow the segment string: with the flag on, the reverse-strand
+/// hit is absent from the located column too, and the extracted sequence - which the
+/// positions are counted along - is unchanged, since the flag does not touch trimming
+/// or orientation.
+#[test]
+fn omit_rc_segs_removes_reverse_hits_from_the_detailed_columns() {
+    let read = format!("{}{}{}", SEG_A, SPACER, rc(SEG_B));
+    let detail = |omit_rc_segs: bool| {
+        let (mut classified, _) = process_reads(
+            vec![raw("read", &read)],
+            &seg_map(&[("A", SEG_A), ("B", SEG_B)]),
+            (0, 0),
+            false,
+            false,
+            omit_rc_segs,
+            true,
+        )
+        .unwrap();
+        let r = classified.remove(0);
+        let d = r
+            .detail
+            .expect("--detailed-output should have filled the detail");
+        (r.segments, d.located, d.sequence)
+    };
+    assert_eq!(
+        detail(false),
+        (
+            "A-B*".to_string(),
+            "A[1:20],B*[33:52]".to_string(),
+            read.clone()
+        )
+    );
+    assert_eq!(
+        detail(true),
+        ("A".to_string(), "A[1:20]".to_string(), read.clone())
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Read length filtering
 // ---------------------------------------------------------------------------
 
@@ -1720,7 +1915,7 @@ fn reads_are_filtered_by_length() {
         ]
     };
 
-    let bounded: Vec<_> = process_reads(reads(), &segments, (30, 50), false, false, false)
+    let bounded: Vec<_> = process_reads(reads(), &segments, (30, 50), false, false, false, false)
         .unwrap()
         .0
         .into_iter()
@@ -1728,7 +1923,7 @@ fn reads_are_filtered_by_length() {
         .collect();
     assert_eq!(bounded, vec!["ok"]);
 
-    let unbounded: Vec<_> = process_reads(reads(), &segments, (0, 0), false, false, false)
+    let unbounded: Vec<_> = process_reads(reads(), &segments, (0, 0), false, false, false, false)
         .unwrap()
         .0
         .into_iter()
@@ -2066,7 +2261,7 @@ fn summary_counts_every_read_under_the_right_reason() {
         raw("out_of_order", &rotated_construct()),
     ];
     let (classified, summary) =
-        process_reads(reads, &segments, (10, 200), false, true, false).unwrap();
+        process_reads(reads, &segments, (10, 200), false, true, false, false).unwrap();
 
     assert_eq!(classified.len(), 1);
     assert_eq!(summary.classified, 1);
@@ -2095,7 +2290,8 @@ fn summary_without_anchoring_only_reports_length_rejections() {
         raw("ok", &format!("{}{}{}", SPACER, SEG_A, SPACER)),
         raw("tiny", "ACGT"),
     ];
-    let (_, summary) = process_reads(reads, &segments, (10, 200), false, false, false).unwrap();
+    let (_, summary) =
+        process_reads(reads, &segments, (10, 200), false, false, false, false).unwrap();
     assert_eq!(summary.classified, 1);
     assert_eq!(summary.too_short, 1);
     assert_eq!(summary.start_anchor_not_found, 0);
@@ -2400,7 +2596,7 @@ fn chunked_processing_matches_processing_everything_at_once() {
                 break;
             }
             let (classified, chunk_summary) =
-                process_reads(chunk, &segments, (0, 0), false, true, false).unwrap();
+                process_reads(chunk, &segments, (0, 0), false, true, false, false).unwrap();
             out.extend(classified.into_iter().map(|r| (r.name, r.segments)));
             summary.merge(chunk_summary);
         }
@@ -2526,6 +2722,7 @@ fn a_zero_bound_means_no_bound_on_that_side() {
             false,
             false,
             false,
+            false,
         )
         .unwrap()
         .0
@@ -2596,6 +2793,7 @@ fn the_extra_columns_are_absent_unless_asked_for() {
         vec![raw("read", &read)],
         &seg_map(&[("A", SEG_A)]),
         (0, 0),
+        false,
         false,
         false,
         false,

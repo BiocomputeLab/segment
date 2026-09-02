@@ -51,6 +51,7 @@ By default every read is classified exactly as it arrives. Passing `-d/--start-e
 | `--counts <FILE>` | off | Also write a CSV counting how many reads produced each distinct classification. See [Classification counts](#classification-counts). |
 | `--detailed-output` | off | Add two columns to the classifications file: where each segment sits in the extracted sequence, and that sequence itself. See [Detailed output](#detailed-output). |
 | `-d`, `--start-end-segs` | off | Use the segments named `start` and `end` to anchor, trim and orient each read; they then bound the segment string instead of being reported within it. Reads missing either anchor are dropped. Errors if the segments file has no `start` or `end` record. |
+| `--omit-rc-segs` | off | Look for each segment on the forward strand only, so no result is ever reported under a starred name. Halves the alignment work. Does not affect read orientation. See [Forward-strand-only searching](#forward-strand-only-searching). |
 | `-c`, `--circular` | off | Treat reads as coming from a circular template, so a read that crosses the origin (`end` before `start`) is rotated back into order rather than rejected. Only meaningful together with `-d`. |
 | `-s`, `--min-norm-score <FLOAT>` | `1.5` | Minimum normalised alignment score for a segment to count as found, from `0.0` to `2.0`, where `2.0` is a perfect match. See [Choosing a score threshold](#choosing-a-score-threshold). |
 | `--per-segment-scores` | off | Use each segment's own threshold from square brackets after its name, as in `>SEG1[1.7]`. Segments without brackets use `--min-norm-score`. The brackets are stripped from the name either way. See [Per-segment thresholds](#per-segment-thresholds). |
@@ -121,6 +122,10 @@ segment --segments scored_refs.fasta --sequences data/reads.fastq -d \
 segment --segments data/refs.fasta --sequences data/reads.fastq \
         --start-end-segs --circular --min-norm-score 1.7 --threads 8 \
         --classifications classifications.txt
+
+# Search the forward strand only, for a construct whose segments cannot be inverted.
+segment --segments data/refs.fasta --sequences data/reads.fastq -d \
+        --omit-rc-segs --classifications classifications.txt
 ```
 
 ## Input files
@@ -247,7 +252,7 @@ The segment string lists the segments found, in the order they occur along the r
 | String | Meaning |
 |---|---|
 | `attP_Bxb1-attB_Tp901` | Both segments found, in that order, on the forward strand |
-| `attB_Tp901*` | Found in reverse-complement orientation (trailing `*`) |
+| `attB_Tp901*` | Found in reverse-complement orientation (trailing `*`) — never produced under [`--omit-rc-segs`](#forward-strand-only-searching) |
 | `attP_Bxb1-attP_Bxb1` | The same segment found twice |
 | *(empty)* | No segment scored above the threshold |
 
@@ -334,7 +339,7 @@ Without `-d`, this stage is skipped entirely: the read is classified exactly as 
 
 ### 3. Segment alignment
 
-Every segment is aligned against the read in both orientations using a semi-global alignment — the whole segment must align, but it may sit anywhere in the read, and gaps at either end of the read are free. Scoring is `+2` for a match, `-1` for a mismatch, and `-2` for a gap (insertion or deletion). Two bases match when the sets of nucleotides they stand for overlap, which for plain `ACGT` is ordinary equality and for [ambiguous bases](#ambiguous-bases) is rather more forgiving.
+Every segment is aligned against the read in both orientations (unless [`--omit-rc-segs`](#forward-strand-only-searching) is given) using a semi-global alignment — the whole segment must align, but it may sit anywhere in the read, and gaps at either end of the read are free. Scoring is `+2` for a match, `-1` for a mismatch, and `-2` for a gap (insertion or deletion). Two bases match when the sets of nucleotides they stand for overlap, which for plain `ACGT` is ordinary equality and for [ambiguous bases](#ambiguous-bases) is rather more forgiving.
 
 The **normalised score** is the raw score divided by the segment length, so a perfect match scores `2.0` regardless of how long the segment is. A segment is only considered found where its normalised score reaches `--min-norm-score`.
 
@@ -349,6 +354,24 @@ Because all segments are searched independently, their hits can overlap. These a
 - A hit entirely **containing** a better-scoring hit is discarded in favour of the contained one.
 
 Ties are broken by position and then by segment name, so two equally good alignments always resolve the same way. Surviving hits are then sorted by position and joined to produce the segment string.
+
+### Forward-strand-only searching
+
+By default a segment is looked for on both strands, and a hit on the reverse strand is reported under a starred name (`attB_Tp901*`). `--omit-rc-segs` turns that second search off: each segment is looked for on the forward strand only, so a segment that sits inverted in the construct is simply not found, and no output can ever carry a `*`.
+
+Use it when the orientation of every segment within the construct is already known and inversions are not what you are looking for. Because it removes one of the two alignments per segment, it roughly halves the time spent in stage 3.
+
+The flag is about **segments, not reads**. Read orientation is decided in stage 2 and is untouched by it: with `-d/--start-end-segs` the anchors are still matched on both strands, and a read sequenced off the opposite strand is still reverse complemented back into construct orientation before its segments are searched for. Both strands of the same molecule therefore still produce the identical segment string. This is what makes `-d --omit-rc-segs` the natural pairing: anchoring establishes the orientation, so searching the reverse strand afterwards only buys you inversions.
+
+Without `-d` there is nothing to orient against, so `--omit-rc-segs` asserts that the reads themselves already arrive on the strand the segments are written on. A reverse-strand read then classifies as nothing rather than as a reversed, starred reading of itself:
+
+| Read | Default | `--omit-rc-segs` |
+|---|---|---|
+| `A`-…-`B` | `A-B` | `A-B` |
+| `A`-…-reverse complement of `B` | `A-B*` | `A` |
+| reverse complement of the whole read | `B*-A*` | *(empty)* |
+
+A segment that is its own reverse complement is unaffected, since both strands are the same sequence.
 
 ### Circular constructs
 
@@ -411,6 +434,7 @@ Options
   --min-norm-score             1.5
   --per-segment-scores         off
   --start-end-segs             on
+  --omit-rc-segs               off
   --circular                   off
   --min-seq-len                0
   --max-seq-len                0
